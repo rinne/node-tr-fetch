@@ -4,8 +4,8 @@ const asn1 = require('asn1js');
 const pki = require('pkijs');
 const { cryptoEngine, parseDer, derElement, derHeader, oidString, extensionsById, extensionValue,
     parseCertificate } = require('./pkiutils');
+const { DEFAULT_MAX_CRL_BYTES } = require('./options');
 
-const MAX_CRL_BYTES = 16 * 1024 * 1024;
 const TIME_TAGS = [ 0x17, 0x18 ];
 
 function distributionPoints(certificate) {
@@ -26,10 +26,11 @@ function distributionPoints(certificate) {
     });
 }
 
-function parseCrl(bytes) {
-    if (bytes.length > MAX_CRL_BYTES) {
-        throw new Error('CRL exceeds the 16 MiB size limit');
+function parseCrl(bytes, maxBytes = DEFAULT_MAX_CRL_BYTES) {
+    if (bytes.length > maxBytes) {
+        throw new Error(`CRL exceeds maxCrlBytes (${maxBytes} bytes)`);
     }
+    const size = bytes.length;
     if (bytes.toString('ascii', 0, 32).trimStart().startsWith('-----BEGIN')) {
         const match = /^\s*-----BEGIN X509 CRL-----\s*([A-Za-z0-9+/=\r\n\t ]+)\s*-----END X509 CRL-----\s*$/.exec(bytes.toString('ascii'));
         if (! match) {
@@ -67,7 +68,7 @@ function parseCrl(bytes) {
     const crl = parseDer(Buffer.concat([ derHeader(0x30, tbsHeader.length + headerLength + trailer.length),
         tbsHeader, ...headerFields, trailer ]), pki.CertificateRevocationList);
     const scan = scanEntries(bytes, entries);
-    return { crl, bytes, tbs: bytes.subarray(tbs.offset, tbs.end), entries,
+    return { crl, size, bytes, tbs: bytes.subarray(tbs.offset, tbs.end), entries,
         revokedCount: scan.count, entryProblem: scan.problem };
 }
 
@@ -253,4 +254,4 @@ async function validateCrl(parsed, certificate, issuer, urls, now = Date.now()) 
     return { revoked, nextUpdate };
 }
 
-module.exports = { MAX_CRL_BYTES, parseCertificate, distributionPoints, parseCrl, validateCrl };
+module.exports = { parseCertificate, distributionPoints, parseCrl, validateCrl };

@@ -1,7 +1,6 @@
 'use strict';
 
 const { assertVerifiedResponse, createAgent } = require('./transport');
-const { MAX_CRL_BYTES } = require('./crl');
 const { debugUrl } = require('./debug');
 
 function networkUrl(value, kind = 'CRL distribution point') {
@@ -21,9 +20,9 @@ function networkUrl(value, kind = 'CRL distribution point') {
     return url;
 }
 
-async function download(value, signal, body, debug) {
+async function download(value, signal, body, debug, maxCrlBytes) {
     const kind = (body === undefined) ? 'CRL' : 'OCSP';
-    const maxBytes = (body === undefined) ? MAX_CRL_BYTES : 1024 * 1024;
+    const maxBytes = (body === undefined) ? maxCrlBytes : 1024 * 1024;
     let url = networkUrl(value, kind);
     const timeout = AbortSignal.timeout(10000);
     const downloadSignal = signal ? AbortSignal.any([ signal, timeout ]) : timeout;
@@ -75,7 +74,8 @@ async function download(value, signal, body, debug) {
                 for await (const chunk of response.body) {
                     length += chunk.byteLength;
                     if (length > maxBytes) {
-                        throw new Error(`${kind} download exceeds the ${maxBytes / (1024 * 1024)} MiB size limit`);
+                        throw new Error((body === undefined) ? `CRL download exceeds maxCrlBytes (${maxBytes} bytes)` :
+                            'OCSP download exceeds the 1 MiB size limit');
                     }
                     chunks.push(chunk);
                 }
@@ -89,8 +89,8 @@ async function download(value, signal, body, debug) {
     }
 }
 
-function downloadCrl(value, signal, debug) {
-    return download(value, signal, undefined, debug);
+function downloadCrl(value, signal, debug, maxBytes) {
+    return download(value, signal, undefined, debug, maxBytes);
 }
 
 function downloadOcsp(value, request, signal, debug) {

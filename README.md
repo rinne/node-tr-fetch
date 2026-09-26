@@ -28,6 +28,7 @@ const response = await trFetch(url, {
 	trFetchDebug: false,
 	trFetchCrlPolicy: {
 		disabled: false,
+		maxCrlBytes: 16777216,
 		missingCrlDistributionPoint: 'ignore',
 		unreachableCrlDistributionPoint: 'reject',
 		invalidCrl: 'reject',
@@ -64,6 +65,23 @@ failure policy accepts `'ignore'`, `'warn'` or `'reject'`.
 continues. `reject` rejects the fetch promise before sending the HTTP request
 on that connection. These policies apply only to revocation checks; they cannot
 relax normal TLS verification.
+
+### CRL size limit
+
+`trFetchCrlPolicy.maxCrlBytes` is the largest CRL accepted, in bytes. It
+defaults to `16777216` (16 MiB) and must be a positive safe integer; there is
+no value for unlimited. Some public CAs publish much larger CRLs, so raise it
+explicitly when needed:
+
+```js
+await trFetch('https://example.com/', { trFetchCrlPolicy: { maxCrlBytes: 64 * 1024 * 1024 } });
+```
+
+A larger download is an unreachable distribution point; larger
+`trFetchCrlOverride` data is an invalid CRL. A cached CRL above the caller's
+limit is not used, even if an earlier caller with a higher limit cached it.
+Revoked entries are scanned in place, so memory use stays close to the CRL's
+size.
 
 ### Disabling a check
 
@@ -305,12 +323,9 @@ CRL retrieval:
   for HTTPS downloads. Download failures use `unreachableCrlDistributionPoint`.
 - Does not copy application cookies, authorization headers or request bodies
   into CRL requests.
-- Allows at most five redirects, 16 MiB of decoded response data and ten seconds
+- Allows at most five redirects, `maxCrlBytes` of decoded response data and ten seconds
   per download including redirects and body reading. Caller cancellation also
   cancels CRL retrieval. At most 32 distribution URIs are tried per certificate.
-- Scans revoked entries in place instead of decoding each into objects, so
-  memory use stays close to the CRL's own size even with hundreds of thousands
-  of entries.
 - Allows private-network HTTP(S) endpoints, including loopback, for private PKI.
   It does not perform filesystem or LDAP lookup.
 - Does not recursively check the CRL download server's CRLs or OCSP status.

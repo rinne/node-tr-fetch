@@ -92,8 +92,14 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
                     const url = networkUrl(source);
                     key = issuerId + ':' + url.href;
                     crl = cache.get(key, options.cacheSize, options.cacheTTL, Date.now(), debug);
+                    // A CRL cached under a higher limit must not bypass this one.
+                    if (crl && (crl.size > options.policy.maxCrlBytes)) {
+                        debug?.('CRL cache entry not used', { source: debugUrl(url), reason: 'exceeds maxCrlBytes',
+                                                              bytes: crl.size, maxCrlBytes: options.policy.maxCrlBytes });
+                        crl = undefined;
+                    }
                     if (! crl) {
-                        bytes = await downloadCrl(url, signal, debug);
+                        bytes = await downloadCrl(url, signal, debug, options.policy.maxCrlBytes);
                     }
                 } catch (cause) {
                     signal?.throwIfAborted();
@@ -105,7 +111,7 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
             let result;
             try {
                 if (! crl) {
-                    crl = parseCrl(bytes);
+                    crl = parseCrl(bytes, options.policy.maxCrlBytes);
                     debug?.('CRL parsed', { source: (source === undefined) ? 'trFetchCrlOverride' : debugUrl(source),
                                             revokedEntries: crl.revokedCount });
                 }

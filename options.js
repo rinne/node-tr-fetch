@@ -1,7 +1,10 @@
 'use strict';
 
+const DEFAULT_MAX_CRL_BYTES = 16 * 1024 * 1024;
+
 const DEFAULT_POLICY = {
     disabled: false,
+    maxCrlBytes: DEFAULT_MAX_CRL_BYTES,
     missingCrlDistributionPoint: 'ignore',
     unreachableCrlDistributionPoint: 'reject',
     invalidCrl: 'reject',
@@ -54,6 +57,12 @@ function parsePolicy(value, defaults, name) {
                 throw new TypeError(`${name}.disabled must be a boolean, null or undefined`);
             }
             policy.disabled = setting ?? false;
+        } else if (key === 'maxCrlBytes') {
+            // Deliberately no value for unlimited; any limit must be explicit.
+            if (! Number.isSafeInteger(setting) || (setting <= 0)) {
+                throw new TypeError(`${name}.maxCrlBytes must be a positive safe integer (bytes)`);
+            }
+            policy.maxCrlBytes = setting;
         } else {
             if (! [ 'ignore', 'warn', 'reject' ].includes(setting)) {
                 throw new TypeError(`${name}.${key} must be ignore, warn or reject`);
@@ -143,4 +152,4 @@ function splitOptions(options) {
              ocspPolicy, ocspUri, ocspCheckDepth, debugEnabled };
 }
 
-module.exports = { splitOptions };
+module.exports = { DEFAULT_MAX_CRL_BYTES, splitOptions };

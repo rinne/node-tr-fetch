@@ -82,11 +82,21 @@ test('defaults, partial policy and stripping without mutating caller options', f
     assert.equal(options.cacheSize, 32);
     assert.equal(options.cacheTTL, -1);
     assert.deepEqual(options.policy, {
-        disabled: false,
+        disabled: false, maxCrlBytes: 16777216,
         missingCrlDistributionPoint: 'ignore', unreachableCrlDistributionPoint: 'reject', invalidCrl: 'warn', revokedCertificate: 'reject'
     });
     assert.equal(splitOptions().cacheTTL, 1800);
     assert.equal(splitOptions().checkDepth, 0);
+});
+
+test('maxCrlBytes accepts only an explicit positive number of bytes, and only for CRLs', function() {
+    for (const value of [ 1, 16777216, 64 * 1024 * 1024, Number.MAX_SAFE_INTEGER ]) {
+        assert.equal(splitOptions({ trFetchCrlPolicy: { maxCrlBytes: value } }).policy.maxCrlBytes, value);
+    }
+    for (const value of [ 0, -1, 1.5, NaN, Infinity, 2 ** 53, '16777216', null, undefined, true, 16777216n ]) {
+        assert.throws(() => splitOptions({ trFetchCrlPolicy: { maxCrlBytes: value } }), /maxCrlBytes must be a positive safe integer/);
+    }
+    assert.throws(() => splitOptions({ trFetchOcspPolicy: { maxCrlBytes: 1 } }), /Unknown trFetchOcspPolicy property/);
 });
 
 test('reject unknown policy keys, invalid values, conflicting overrides and custom dispatchers', function() {

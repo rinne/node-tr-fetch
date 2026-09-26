@@ -295,6 +295,27 @@ test('default TLS trust, validity and hostname checks cannot be relaxed by CRL p
     }
 });
 
+test('maxCrlBytes limits CRL downloads, override data and cached CRLs, and can be raised', async function(t) {
+    const big = await fixtures.bulkCrl(ca, 800000, { serials: [ 42 ] });
+    assert.ok(big.length > 16 * 1024 * 1024);
+    routes.set('/big.crl', big);
+    const server = await endpoint(t, { urls: [ crlBase + '/big.crl' ] });
+    await assert.rejects(trFetch(server.url), crlError('TR_FETCH_CRL_UNREACHABLE_DISTRIBUTION_POINT',
+        /CRL download exceeds maxCrlBytes \(16777216 bytes\)/));
+    const raised = { maxCrlBytes: 32 * 1024 * 1024 };
+    await assert.rejects(trFetch(server.url, { trFetchCrlPolicy: raised }), crlError('TR_FETCH_CERTIFICATE_REVOKED', /Revoked/));
+    // Now cached; the cache must not let it bypass a lower limit.
+    const events = captureDebug(t);
+    await assert.rejects(trFetch(server.url, { trFetchDebug: true }), { code: 'TR_FETCH_CRL_UNREACHABLE_DISTRIBUTION_POINT' });
+    assert.ok(events.some(x => (x.event === 'CRL cache entry not used') && (x.maxCrlBytes === 16777216)));
+    t.mock.restoreAll();
+    await assert.rejects(trFetch(server.url, { trFetchCrlPolicy: raised }), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
+    const small = await endpoint(t);
+    await assert.rejects(trFetch(small.url, { trFetchCrlOverride: goodCrl.der, trFetchCrlPolicy: { maxCrlBytes: goodCrl.der.length - 1 } }),
+        crlError('TR_FETCH_CRL_INVALID', /CRL exceeds maxCrlBytes/));
+    await (await trFetch(small.url, { trFetchCrlOverride: goodCrl.der, trFetchCrlPolicy: { maxCrlBytes: goodCrl.der.length } })).text();
+});
+
 test('CRL cache is shared, TTL zero and nonpositive sizes bypass it', async function(t) {
     routes.set('/cache', goodCrl.der);
     const server = await endpoint(t, { urls: [ crlBase + '/cache' ] });
