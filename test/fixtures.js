@@ -1,6 +1,6 @@
 'use strict';
 
-const { webcrypto } = require('node:crypto');
+const { KeyObject, sign, webcrypto } = require('node:crypto');
 const asn1 = require('asn1js');
 const pki = require('pkijs');
 
@@ -109,4 +109,48 @@ async function ocsp(issuer, requestBytes, { signer = issuer, status = 'good', by
     return { der: Buffer.from(envelope.toSchema().toBER()), basic };
 }
 
-module.exports = { certificate, crl, ocsp, extension };
+function der(tag, ...parts) {
+    const body = Buffer.concat(parts);
+    const length = [];
+    for (let value = body.length; value > 0; value = Math.floor(value / 256)) {
+        length.unshift(value % 256);
+    }
+    return Buffer.concat([ Buffer.from((body.length < 0x80) ? [ tag, body.length ] : [ tag, 0x80 | length.length, ...length ]), body ]);
+}
+
+// A signed CRL with many revoked entries, encoded directly because PKI.js
+// needs minutes for a CRL of this size. Serials count up from 0x100000.
+async function bulkCrl(issuer, count, { serials = [], entry } = {}) {
+    const small = (await crl(issuer)).value;
+    const tbs = Buffer.from(small.tbsView);
+    const fields = [];
+    const outer = tbs[1] & 0x80 ? 2 + (tbs[1] & 0x7f) : 2;
+    for (let offset = outer; offset < tbs.length;) {
+        const lengthBytes = (tbs[offset + 1] & 0x80) ? (tbs[offset + 1] & 0x7f) : 0;
+        let length = lengthBytes ? 0 : tbs[offset + 1];
+        for (let i = 0; i < lengthBytes; i++) {
+            length = (length * 256) + tbs[offset + 2 + i];
+        }
+        const end = offset + 2 + lengthBytes + length;
+        fields.push(tbs.subarray(offset, end));
+        offset = end;
+    }
+    const date = der(0x17, Buffer.from('260101000000Z'));
+    const entries = [];
+    for (let i = 0; i < count; i++) {
+        const serial = 0x100000 + i;
+        entries.push(der(0x30, der(0x02, Buffer.from([ serial >> 16, (serial >> 8) & 0xff, serial & 0xff ])), date));
+    }
+    for (const serial of serials) {
+        entries.push(der(0x30, der(0x02, Buffer.from([ serial ])), date));
+    }
+    if (entry) {
+        entries.push(entry);
+    }
+    // version, signature, issuer, thisUpdate, nextUpdate, then the entries.
+    const body = der(0x30, ...fields.slice(0, 5), der(0x30, Buffer.concat(entries)), ...fields.slice(5));
+    const signature = sign('sha256', body, { key: KeyObject.from(issuer.keys.privateKey), dsaEncoding: 'der' });
+    return der(0x30, body, Buffer.from(small.signatureAlgorithm.toSchema().toBER()), der(0x03, Buffer.from([ 0 ]), signature));
+}
+
+module.exports = { certificate, crl, bulkCrl, ocsp, extension };

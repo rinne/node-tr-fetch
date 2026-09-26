@@ -107,7 +107,7 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
                 if (! crl) {
                     crl = parseCrl(bytes);
                     debug?.('CRL parsed', { source: (source === undefined) ? 'trFetchCrlOverride' : debugUrl(source),
-                                            revokedEntries: crl.revokedCertificates?.length ?? 0 });
+                                            revokedEntries: crl.revokedCount });
                 }
                 result = await validateCrl(crl, certificate, issuer, point.urls);
             } catch (cause) {

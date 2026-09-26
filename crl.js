@@ -2,13 +2,11 @@
 
 const asn1 = require('asn1js');
 const pki = require('pkijs');
-const { cryptoEngine, parseDer, extensionsById, extensionValue, parseCertificate } = require('./pkiutils');
+const { cryptoEngine, parseDer, derElement, derHeader, oidString, extensionsById, extensionValue,
+    parseCertificate } = require('./pkiutils');
 
 const MAX_CRL_BYTES = 16 * 1024 * 1024;
-// A revoked entry takes three to seven ASN.1 nodes, so this allows CRLs of
-// several hundred thousand entries. Unlike the byte limit, it also bounds the
-// memory used by hostile input made of minimal nodes (about 0.6 GB).
-const MAX_CRL_NODES = 1000000;
+const TIME_TAGS = [ 0x17, 0x18 ];
 
 function distributionPoints(certificate) {
     const extension = extensionsById(certificate.extensions).get('2.5.29.31');
@@ -43,7 +41,110 @@ function parseCrl(bytes) {
             throw new Error('Malformed base64 in PEM CRL');
         }
     }
-    return parseDer(bytes, pki.CertificateRevocationList, { maxNodes: MAX_CRL_NODES, maxContentLength: MAX_CRL_BYTES });
+    const outer = derElement(bytes, 0);
+    if (outer.end !== bytes.length) {
+        throw new Error('Malformed ASN.1 data: trailing bytes');
+    }
+    const tbs = derElement(bytes, outer.start, outer.end);
+    if ((outer.tag !== 0x30) || (tbs.tag !== 0x30)) {
+        throw new Error('Malformed CRL structure');
+    }
+    const fields = [];
+    for (let offset = tbs.start; offset < tbs.end; offset = fields.at(-1).end) {
+        fields.push(derElement(bytes, offset, tbs.end));
+    }
+    // version, signature, issuer, thisUpdate, nextUpdate, revokedCertificates
+    let index = (fields[0]?.tag === 0x02) ? 3 : 2;
+    index += TIME_TAGS.includes(fields[index + 1]?.tag) ? 2 : 1;
+    const entries = (fields[index]?.tag === 0x30) ? fields[index] : undefined;
+    // Decoding every revoked entry into an ASN.1 object tree takes hundreds of
+    // bytes of memory per encoded byte, so large CRLs could exhaust the heap.
+    // PKI.js decodes the rest; the entries are scanned in place.
+    const headerFields = fields.filter(x => x !== entries).map(x => bytes.subarray(x.offset, x.end));
+    const headerLength = headerFields.reduce((sum, x) => sum + x.length, 0);
+    const trailer = bytes.subarray(tbs.end, outer.end);
+    const tbsHeader = derHeader(0x30, headerLength);
+    const crl = parseDer(Buffer.concat([ derHeader(0x30, tbsHeader.length + headerLength + trailer.length),
+        tbsHeader, ...headerFields, trailer ]), pki.CertificateRevocationList);
+    const scan = scanEntries(bytes, entries);
+    return { crl, bytes, tbs: bytes.subarray(tbs.offset, tbs.end), entries,
+        revokedCount: scan.count, entryProblem: scan.problem };
+}
+
+function checkEntryExtensions(bytes, list) {
+    const seen = new Set();
+    let problem;
+    for (let offset = list.start; offset < list.end;) {
+        const extension = derElement(bytes, offset, list.end);
+        offset = extension.end;
+        const id = derElement(bytes, extension.start, extension.end);
+        let value = derElement(bytes, id.end, extension.end);
+        let critical = false;
+        if (value.tag === 0x01) {
+            critical = (value.end > value.start) && (bytes[value.start] !== 0);
+            value = derElement(bytes, value.end, extension.end);
+        }
+        if ((extension.tag !== 0x30) || (id.tag !== 0x06) || (value.tag !== 0x04) || (value.end !== extension.end)) {
+            throw new Error('Malformed CRL entry extension');
+        }
+        const extnID = oidString(bytes.subarray(id.start, id.end));
+        if (seen.has(extnID)) {
+            problem ??= `Duplicate extension ${extnID}`;
+        }
+        seen.add(extnID);
+        if (extnID === '2.5.29.29') {
+            problem ??= 'Indirect CRL certificateIssuer entries are unsupported';
+        } else if (critical) {
+            problem ??= `Unsupported critical CRL entry extension ${extnID}`;
+        } else if (extnID === '2.5.29.21') {
+            const reason = derElement(bytes, value.start, value.end);
+            let code = 0;
+            for (let i = reason.start; i < reason.end; i++) {
+                code = (code * 256) + bytes[i];
+            }
+            if ((reason.tag !== 0x0a) || (reason.end !== value.end) || (reason.end === reason.start) || (code === 8)) {
+                problem ??= 'Invalid revocation reason in a complete CRL';
+            }
+        }
+    }
+    return problem;
+}
+
+// Walk the revoked entries without decoding them into objects. Structural
+// errors throw; the first unsupported entry is reported for use after the CRL
+// is authenticated. With a serial, also report whether it is listed.
+function scanEntries(bytes, entries, serial) {
+    let count = 0;
+    let problem;
+    let revoked = false;
+    for (let offset = entries?.start; offset < entries?.end;) {
+        const entry = derElement(bytes, offset, entries.end);
+        offset = entry.end;
+        const number = derElement(bytes, entry.start, entry.end);
+        const date = derElement(bytes, number.end, entry.end);
+        let next = date.end;
+        if ((entry.tag !== 0x30) || (number.tag !== 0x02) || ! TIME_TAGS.includes(date.tag)) {
+            throw new Error('Malformed revoked certificate entry');
+        }
+        if (next < entry.end) {
+            const extensions = derElement(bytes, next, entry.end);
+            if (extensions.tag !== 0x30) {
+                throw new Error('Malformed revoked certificate entry');
+            }
+            if (serial === undefined) {
+                problem ??= checkEntryExtensions(bytes, extensions);
+            }
+            next = extensions.end;
+        }
+        if (next !== entry.end) {
+            throw new Error('Malformed revoked certificate entry');
+        }
+        count++;
+        if ((serial !== undefined) && bytes.subarray(number.start, number.end).equals(serial)) {
+            revoked = true;
+        }
+    }
+    return { count, problem, revoked };
 }
 
 function checkValidity(crl, now = Date.now()) {
@@ -95,7 +196,8 @@ function checkScope(crl, certificate, urls) {
     return extensions;
 }
 
-async function validateCrl(crl, certificate, issuer, urls, now = Date.now()) {
+async function validateCrl(parsed, certificate, issuer, urls, now = Date.now()) {
+    const crl = parsed.crl;
     const nextUpdate = checkValidity(crl, now);
     const extensions = checkScope(crl, certificate, urls);
     if (! crl.issuer.isEqual(certificate.issuer) || ! crl.issuer.isEqual(issuer.subject)) {
@@ -138,31 +240,17 @@ async function validateCrl(crl, certificate, issuer, urls, now = Date.now()) {
     if (crlNumber && ! (extensionValue(crlNumber) instanceof asn1.Integer)) {
         throw new Error('Malformed CRL number');
     }
-    if (! await crl.verify({ issuerCertificate: issuer }, cryptoEngine)) {
+    // The signature covers the original TBS bytes, including the entries.
+    if (! await cryptoEngine.verifyWithPublicKey(parsed.tbs, crl.signatureValue, issuer.subjectPublicKeyInfo, crl.signatureAlgorithm)) {
         throw new Error('CRL signature verification failed');
     }
-    let revoked = false;
-    for (const entry of crl.revokedCertificates ?? []) {
-        for (const extension of extensionsById(entry.crlEntryExtensions?.extensions).values()) {
-            if (extension.extnID === '2.5.29.29') {
-                throw new Error('Indirect CRL certificateIssuer entries are unsupported');
-            }
-            if (extension.critical) {
-                throw new Error(`Unsupported critical CRL entry extension ${extension.extnID}`);
-            }
-            if (extension.extnID === '2.5.29.21') {
-                const reason = extensionValue(extension);
-                if (! (reason instanceof asn1.Enumerated) || (reason.valueBlock.valueDec === 8)) {
-                    throw new Error('Invalid revocation reason in a complete CRL');
-                }
-            }
-        }
-        if (entry.userCertificate.isEqual(certificate.serialNumber)) {
-            revoked = true;
-        }
+    if (parsed.entryProblem) {
+        throw new Error(parsed.entryProblem);
     }
+    const serial = Buffer.from(certificate.serialNumber.valueBlock.valueHexView);
+    const { revoked } = scanEntries(parsed.bytes, parsed.entries, serial);
     checkValidity(crl);
     return { revoked, nextUpdate };
 }
 
-module.exports = { MAX_CRL_BYTES, MAX_CRL_NODES, parseCertificate, distributionPoints, parseCrl, validateCrl };
+module.exports = { MAX_CRL_BYTES, parseCertificate, distributionPoints, parseCrl, validateCrl };
