@@ -388,7 +388,14 @@ checks. Only `http:` and `https:` URLs are supported; a URL without a scheme
 defaults to `http://`.
 
 ```sh
-npx tr-curl -v https://example.com/
+npx -p tr-fetch tr-curl -v https://example.com/
+```
+
+The command is in the `tr-fetch` package, so `npx` needs `-p tr-fetch`.
+After `npm install -g tr-fetch`, or inside a project that depends on it,
+`tr-curl` can be run directly:
+
+```sh
 tr-curl -fsSL -o page.html https://example.com/
 tr-curl --json '{"a":1}' -u user:password https://api.example.com/items
 tr-curl --cacert private-ca.pem --crlfile current.crl https://internal.example/
