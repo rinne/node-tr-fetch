@@ -5,6 +5,10 @@ const pki = require('pkijs');
 const { cryptoEngine, parseDer, extensionsById, extensionValue, parseCertificate } = require('./pkiutils');
 
 const MAX_CRL_BYTES = 16 * 1024 * 1024;
+// A revoked entry takes three to seven ASN.1 nodes, so this allows CRLs of
+// several hundred thousand entries. Unlike the byte limit, it also bounds the
+// memory used by hostile input made of minimal nodes (about 0.6 GB).
+const MAX_CRL_NODES = 1000000;
 
 function distributionPoints(certificate) {
     const extension = extensionsById(certificate.extensions).get('2.5.29.31');
@@ -39,7 +43,7 @@ function parseCrl(bytes) {
             throw new Error('Malformed base64 in PEM CRL');
         }
     }
-    return parseDer(bytes, pki.CertificateRevocationList);
+    return parseDer(bytes, pki.CertificateRevocationList, { maxNodes: MAX_CRL_NODES, maxContentLength: MAX_CRL_BYTES });
 }
 
 function checkValidity(crl, now = Date.now()) {
@@ -161,4 +165,4 @@ async function validateCrl(crl, certificate, issuer, urls, now = Date.now()) {
     return { revoked, nextUpdate };
 }
 
-module.exports = { MAX_CRL_BYTES, parseCertificate, distributionPoints, parseCrl, validateCrl };
+module.exports = { MAX_CRL_BYTES, MAX_CRL_NODES, parseCertificate, distributionPoints, parseCrl, validateCrl };

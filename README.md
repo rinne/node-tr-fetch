@@ -308,6 +308,9 @@ CRL retrieval:
 - Allows at most five redirects, 16 MiB of decoded response data and ten seconds
   per download including redirects and body reading. Caller cancellation also
   cancels CRL retrieval. At most 32 distribution URIs are tried per certificate.
+- Parses at most 1,000,000 ASN.1 nodes per CRL, enough for several hundred
+  thousand revoked entries. This bounds the memory that a hostile CRL can use
+  (about 0.6 GB); larger CRLs are invalid.
 - Allows private-network HTTP(S) endpoints, including loopback, for private PKI.
   It does not perform filesystem or LDAP lookup.
 - Does not recursively check the CRL download server's CRLs or OCSP status.

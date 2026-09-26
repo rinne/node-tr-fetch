@@ -70,7 +70,7 @@ async function crl(issuer, { serials = [], start = Date.now() - 60000, end = Dat
         value.crlExtensions = new pki.Extensions({ extensions });
     }
     await value.sign(signingKey ?? issuer.keys.privateKey, hash, engine);
-    const der = Buffer.from(value.toSchema().toBER());
+    const der = Buffer.from(value.toSchema(true).toBER());
     return { der, pem: pem('X509 CRL', der), value };
 }
 

@@ -6,10 +6,14 @@ const { webcrypto } = require('node:crypto');
 
 const cryptoEngine = new pki.CryptoEngine({ name: 'tr-fetch', crypto: webcrypto });
 
-function parseDer(bytes, Type) {
-    const decoded = asn1.fromBER(bytes);
-    if ((decoded.offset !== bytes.length) || decoded.result.error) {
-        throw new Error('Malformed ASN.1 data or trailing bytes');
+// Limits default to asn1js's own; see its fromBER() resource limits.
+function parseDer(bytes, Type, limits) {
+    const decoded = asn1.fromBER(bytes, limits);
+    if (decoded.result.error) {
+        throw new Error(`Malformed ASN.1 data: ${decoded.result.error}`);
+    }
+    if (decoded.offset !== bytes.length) {
+        throw new Error('Malformed ASN.1 data: trailing bytes');
     }
     return new Type({ schema: decoded.result });
 }

@@ -4,7 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const asn1 = require('asn1js');
 const pki = require('pkijs');
-const { parseCrl, validateCrl } = require('../crl');
+const { MAX_CRL_NODES, parseCrl, validateCrl } = require('../crl');
 const fixtures = require('./fixtures');
 
 let ca, leaf;
@@ -81,4 +81,23 @@ test('indirect entries, removeFromCRL and unknown critical entry extensions are 
                                                    crlEntryExtensions: new pki.Extensions({ extensions: [ extension ] }) });
         await assert.rejects(validate({ entries: [ entry ] }), /unsupported|Invalid revocation reason|Unsupported critical/);
     }
+});
+
+test('large CRLs beyond the default ASN.1 node limit are parsed', async function() {
+    // About 5000 entries is typical of a public CA CRL shard; asn1js's default
+    // limit of 10000 nodes would reject it.
+    const serials = Array.from({ length: 5000 }, (_, i) => 1000 + i);
+    assert.equal((await validate({ serials })).revoked, false);
+    assert.equal((await validate({ serials: [ ...serials, 42 ] })).revoked, true);
+});
+
+test('hostile CRLs made of excessive ASN.1 nodes are rejected', function() {
+    const count = MAX_CRL_NODES + 1;
+    const body = Buffer.alloc(count * 2);
+    for (let i = 0; i < count; i++) {
+        body[2 * i] = 0x05;
+    }
+    const header = Buffer.from([ 0x30, 0x84, 0, 0, 0, 0 ]);
+    header.writeUInt32BE(body.length, 2);
+    assert.throws(() => parseCrl(Buffer.concat([ header, body ])), /Malformed ASN.1 data: Maximum ASN.1 node count exceeded/);
 });
