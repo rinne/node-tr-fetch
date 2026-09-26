@@ -26,6 +26,14 @@ function tlsMaxCb(value) {
     return (value === 'default') ? value : TLS_VERSIONS[value];
 }
 
+function positiveBytesCb(value) {
+    return (/^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value))) ? Number(value) : undefined;
+}
+
+function networkUrlCb(value) {
+    return (URL.canParse(value) && [ 'http:', 'https:' ].includes(new URL(value).protocol)) ? value : undefined;
+}
+
 function jsonObjectCb(value) {
     try {
         const parsed = JSON.parse(value);
@@ -96,7 +104,10 @@ function optionDefinitions() {
         flag(undefined, 'tlsv1.3', 'Use TLSv1.3 or greater'),
         arg(undefined, 'tls-max', '<version> Maximum TLS version: 1.0, 1.1, 1.2, 1.3 or default', tlsMaxCb),
         arg(undefined, 'tls13-ciphers', '<list> TLS 1.3 cipher suites to use'),
-        arg(undefined, 'trfetch-options', '<json> Extra trFetch options as a JSON object', jsonObjectCb, true),
+        arg(undefined, 'tr-fetch-max-crl-bytes', '<bytes> Largest CRL accepted (default 16777216)', positiveBytesCb),
+        arg(undefined, 'tr-fetch-crl-url', '<url> Fetch the server certificate\'s CRL from this URL instead', networkUrlCb),
+        arg(undefined, 'tr-fetch-ocsp-url', '<url> Query this OCSP responder for the server certificate instead', networkUrlCb),
+        arg(undefined, 'tr-fetch-options', '<json> Extra trFetch options as a JSON object', jsonObjectCb, true),
         arg('u', 'user', '<user:password> Server user and password (basic authentication)'),
         arg(undefined, 'url', '<url> URL to work with', undefined, true),
         flag('v', 'verbose', 'Make the operation more talkative, including trFetch debug output', true),
@@ -123,11 +134,29 @@ function parseArguments(argv) {
     if (value('output').length && value('remote-name')) {
         throw new UsageError('--output and --remote-name cannot be used together');
     }
-    const trFetchOptions = Object.assign({}, ...value('trfetch-options'));
+    const trFetchOptions = Object.assign({}, ...value('tr-fetch-options'));
     for (const key of Object.keys(trFetchOptions)) {
         if (! /^trFetch/.test(key)) {
-            throw new UsageError(`--trfetch-options accepts only trFetch options, not ${JSON.stringify(key)}`);
+            throw new UsageError(`--tr-fetch-options accepts only trFetch options, not ${JSON.stringify(key)}`);
         }
+    }
+    // Dedicated options take precedence over the same settings given in
+    // --tr-fetch-options, regardless of their order.
+    if (value('tr-fetch-max-crl-bytes') !== undefined) {
+        const policy = trFetchOptions.trFetchCrlPolicy;
+        // Leave a malformed policy for trFetch to reject.
+        if ((policy === undefined) || (policy && (typeof(policy) === 'object') && ! Array.isArray(policy))) {
+            trFetchOptions.trFetchCrlPolicy = { ...policy, maxCrlBytes: value('tr-fetch-max-crl-bytes') };
+        }
+    }
+    if (value('tr-fetch-crl-url') !== undefined) {
+        if (value('crlfile') !== undefined) {
+            throw new UsageError('--tr-fetch-crl-url and --crlfile cannot be used together');
+        }
+        trFetchOptions.trFetchCrlDistributionPointOverride = value('tr-fetch-crl-url');
+    }
+    if (value('tr-fetch-ocsp-url') !== undefined) {
+        trFetchOptions.trFetchOcspUriOverride = value('tr-fetch-ocsp-url');
     }
     const data = [ 'data', 'data-ascii', 'data-binary', 'data-raw', 'data-urlencode', 'json' ]
           .flatMap(value).sort((a, b) => a.seq - b.seq);

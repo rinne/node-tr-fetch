@@ -73,6 +73,7 @@ test.before(async function() {
     routes.set('/crl-revoked', async (req, res) => res.end((await fixtures.crl(ca, { serials: [ 43 ] })).der));
     routes.set('/ocsp', ocspRoute(ca));
     routes.set('/ocsp-revoked', ocspRoute(ca, { status: 'revoked' }));
+    routes.set('/crl-42', async (req, res) => res.end((await fixtures.crl(ca, { serials: [ 42 ] })).der));
     [ secure, secureUrl ] = await httpsServer(await fixtures.certificate({ issuer: ca, serial: 42,
                                                                            urls: [ base + '/crl' ], ocspUrls: [ base + '/ocsp' ] }));
     [ revoked, revokedUrl ] = await httpsServer(await fixtures.certificate({ issuer: ca, serial: 43,
@@ -114,7 +115,7 @@ test('help, version and usage errors', async function() {
     assert.equal(version.code, 0);
     assert.match(version.stdout, /^tr-curl \d+\.\d+\.\d+ .*\nProtocols: http https\n/);
     for (const args of [ [ '--bogus', base ], [ '-m', 'soon', base ], [], [ '-f', '--fail-with-body', base ],
-                         [ '-I', '-d', 'x', base ], [ '-o', 'a', '-O', base ], [ '--trfetch-options', '{"method":"PUT"}', base ] ]) {
+                         [ '-I', '-d', 'x', base ], [ '-o', 'a', '-O', base ], [ '--tr-fetch-options', '{"method":"PUT"}', base ], [ '--trfetch-options', '{}', base ] ]) {
         const result = await curl(args);
         assert.equal(result.code, 2, args.join(' '));
         assert.match(result.stderr, /^tr-curl: /);
@@ -302,11 +303,11 @@ test('HTTPS uses trFetch CRL and OCSP checks, with --cacert trust', async functi
     result = await curl([ '-sS', '--cacert', caFile, revokedUrl ]);
     assert.equal(result.code, 60);
     assert.match(result.stderr, /Revoked server certificate/);
-    result = await curl([ '-sS', '--cacert', caFile, '--trfetch-options', '{"trFetchCrlPolicy":{"disabled":true}}', revokedUrl ]);
+    result = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-options', '{"trFetchCrlPolicy":{"disabled":true}}', revokedUrl ]);
     assert.equal(result.code, 91);
     assert.match(result.stderr, /OCSP/);
-    result = await curl([ '-sS', '--cacert', caFile, '--trfetch-options', '{"trFetchCrlPolicy":{"disabled":true}}',
-                          '--trfetch-options', '{"trFetchOcspPolicy":{"rejectedCertificate":"ignore"}}', revokedUrl ]);
+    result = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-options', '{"trFetchCrlPolicy":{"disabled":true}}',
+                          '--tr-fetch-options', '{"trFetchOcspPolicy":{"rejectedCertificate":"ignore"}}', revokedUrl ]);
     assert.equal(result.code, 0);
     const crlFile = path.join(tmp, 'revoked.crl');
     fs.writeFileSync(crlFile, (await fixtures.crl(ca, { serials: [ 42 ] })).pem);
@@ -314,7 +315,40 @@ test('HTTPS uses trFetch CRL and OCSP checks, with --cacert trust', async functi
     assert.equal(result.code, 60);
     assert.equal((await curl([ '-sS', '--cacert', path.join(tmp, 'none.pem'), secureUrl ])).code, 77);
     assert.equal((await curl([ '-sS', '--cacert', caFile, '--crlfile', path.join(tmp, 'none.crl'), secureUrl ])).code, 82);
-    assert.equal((await curl([ '-sS', '--cacert', caFile, '--trfetch-options', '{"trFetchCrlPolicy":"bad"}', secureUrl ])).code, 2);
+    assert.equal((await curl([ '-sS', '--cacert', caFile, '--tr-fetch-options', '{"trFetchCrlPolicy":"bad"}', secureUrl ])).code, 2);
+});
+
+test('--tr-fetch-* options set the CRL size limit and CRL/OCSP locations, overriding --tr-fetch-options', async function() {
+    const help = (await curl([ '--help' ])).stdout;
+    for (const name of [ 'max-crl-bytes <bytes>', 'crl-url <url>', 'ocsp-url <url>', 'options <json>' ]) {
+        assert.match(help, new RegExp(`--tr-fetch-${name}`));
+    }
+    let result = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-max-crl-bytes', '10', secureUrl ]);
+    assert.equal(result.code, 60);
+    assert.match(result.stderr, /CRL download exceeds maxCrlBytes \(10 bytes\)/);
+    result = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-options', '{"trFetchCrlPolicy":{"maxCrlBytes":10}}',
+        '--tr-fetch-max-crl-bytes=100000', secureUrl ]);
+    assert.equal(result.code, 0);
+    // The size limit merges into the policy instead of replacing it: the
+    // revoked CRL result is ignored, so OCSP reports the revocation.
+    result = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-max-crl-bytes', '100000',
+        '--tr-fetch-options', '{"trFetchCrlPolicy":{"revokedCertificate":"ignore"}}', revokedUrl ]);
+    assert.equal(result.code, 91);
+    for (const value of [ '0', '-1', '1.5', '1k', '', '99999999999999999' ]) {
+        assert.equal((await curl([ '-s', '--tr-fetch-max-crl-bytes', value, secureUrl ])).code, 2, value);
+    }
+    result = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-crl-url', `${base}/crl-42`, secureUrl ]);
+    assert.equal(result.code, 60);
+    assert.match(result.stderr, /Revoked server certificate/);
+    result = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-options', `{"trFetchCrlDistributionPointOverride":"${base}/crl-42"}`,
+        '--tr-fetch-crl-url', `${base}/crl`, secureUrl ]);
+    assert.equal(result.code, 0);
+    result = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-ocsp-url', `${base}/ocsp-revoked`, secureUrl ]);
+    assert.equal(result.code, 91);
+    for (const args of [ [ '--tr-fetch-crl-url', 'ftp://example.com/x.crl' ], [ '--tr-fetch-ocsp-url', 'not a url' ],
+        [ '--tr-fetch-crl-url', `${base}/crl`, '--crlfile', caFile ] ]) {
+        assert.equal((await curl([ '-s', ...args, secureUrl ])).code, 2, args.join(' '));
+    }
 });
 
 test('--insecure bypasses TLS verification and revocation checks', async function() {
@@ -332,7 +366,7 @@ test('TLS version and cipher options', async function() {
     const leaf = await fixtures.certificate({ issuer: ca, serial: 44 });
     const tls12 = https.createServer({ cert: leaf.pem, key: leaf.key, maxVersion: 'TLSv1.2' }, (req, res) => res.end('tls12'));
     const url = `https://localhost:${await listen(tls12)}/`;
-    const common = [ '-sS', '--cacert', caFile, '--trfetch-options',
+    const common = [ '-sS', '--cacert', caFile, '--tr-fetch-options',
                      '{"trFetchCrlPolicy":{"disabled":true},"trFetchOcspPolicy":{"disabled":true}}' ];
     try {
         assert.equal((await curl([ ...common, '--tlsv1.2', url ])).stdout, 'tls12');

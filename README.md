@@ -431,15 +431,27 @@ tr-curl --cacert private-ca.pem --crlfile current.crl https://internal.example/
 | Failure and limits | `-f/--fail`, `--fail-with-body`, `--fail-early`, `--max-filesize`, `-m/--max-time` |
 | Messages | `-v/--verbose`, `-s/--silent`, `-S/--show-error`, `--no-progress-meter`, `-#/--progress-bar`, `-h/--help`, `-V/--version` |
 | TLS | `-k/--insecure`, `--cacert`, `--crlfile`, `-1/--tlsv1`, `--tlsv1.0` … `--tlsv1.3`, `--tls-max`, `--ciphers`, `--tls13-ciphers` |
-| trFetch | `--trfetch-options <json>` |
+| trFetch | `--tr-fetch-max-crl-bytes`, `--tr-fetch-crl-url`, `--tr-fetch-ocsp-url`, `--tr-fetch-options` |
 
 `--verbose` prints the request and response headers, prefixed with `>` and
 `<` like curl, and also enables `trFetchDebug`, so the revocation diagnostics
-appear on stderr. `--trfetch-options` takes a JSON object of trFetch options,
-for example `'{"trFetchCrlCheckDepth":"full-chain"}'`. The option can be
-repeated, and later objects override earlier keys. `--crlfile` sets
-`trFetchCrlOverride`. `--cacert` replaces Node's default CA certificates for
-the process.
+appear on stderr. `--cacert` replaces Node's default CA certificates for the
+process.
+
+The `--tr-fetch-*` options set trFetch options directly:
+
+| Option | trFetch option |
+|---|---|
+| `--tr-fetch-max-crl-bytes <bytes>` | `trFetchCrlPolicy.maxCrlBytes`, a positive integer |
+| `--tr-fetch-crl-url <url>` | `trFetchCrlDistributionPointOverride` |
+| `--tr-fetch-ocsp-url <url>` | `trFetchOcspUriOverride` |
+| `--crlfile <file>` | `trFetchCrlOverride`, read from the file |
+
+`--tr-fetch-options` takes a JSON object of any trFetch options, for example
+`'{"trFetchCrlCheckDepth":"full-chain"}'`. It can be repeated; later objects
+replace earlier keys. The options above take precedence over the same
+settings in it, whatever their order, and `--tr-fetch-max-crl-bytes` is merged
+into its `trFetchCrlPolicy` rather than replacing it.
 
 `--insecure` cannot be implemented through trFetch, which never relaxes TLS
 verification. With `-k`, tr-curl uses plain fetch with an unverified TLS
