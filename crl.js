@@ -1,8 +1,9 @@
 'use strict';
 
+const { X509Certificate, constants, verify } = require('node:crypto');
 const asn1 = require('asn1js');
 const pki = require('pkijs');
-const { cryptoEngine, parseDer, derElement, derHeader, oidString, extensionsById, extensionValue,
+const { cryptoEngine, parseDer, derElement, derRead, derHeader, oidString, extensionsById, extensionValue,
     parseCertificate } = require('./pkiutils');
 const { DEFAULT_MAX_CRL_BYTES } = require('./options');
 const { buildSerialIndex } = require('./serials');
@@ -73,33 +74,69 @@ function parseCrl(bytes, maxBytes = DEFAULT_MAX_CRL_BYTES) {
         revokedCount: scan.count, entryProblem: scan.problem };
 }
 
-function checkEntryExtensions(bytes, list) {
-    const seen = new Set();
+const OID_CERTIFICATE_ISSUER = Buffer.from([ 0x55, 0x1d, 0x1d ]);
+const OID_REASON_CODE = Buffer.from([ 0x55, 0x1d, 0x15 ]);
+
+function sameBytes(bytes, start, end, expected) {
+    if ((end - start) !== expected.length) {
+        return false;
+    }
+    for (let i = 0; i < expected.length; i++) {
+        if (bytes[start + i] !== expected[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+function sameRange(bytes, a, b, c, d) {
+    if ((b - a) !== (d - c)) {
+        return false;
+    }
+    for (let i = 0; i < (b - a); i++) {
+        if (bytes[a + i] !== bytes[c + i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Reusable elements for walking entries: hundreds of thousands of entries
+// must not create an object each. Walks are synchronous, so one set per walk.
+function scratch() {
+    return { entry: {}, number: {}, date: {}, extensions: {}, extension: {}, id: {}, value: {}, reason: {}, ids: [] };
+}
+
+function checkEntryExtensions(bytes, list, s) {
     let problem;
+    s.ids.length = 0;
     for (let offset = list.start; offset < list.end;) {
-        const extension = derElement(bytes, offset, list.end);
+        const extension = derRead(bytes, offset, list.end, s.extension);
         offset = extension.end;
-        const id = derElement(bytes, extension.start, extension.end);
-        let value = derElement(bytes, id.end, extension.end);
+        const id = derRead(bytes, extension.start, extension.end, s.id);
+        let value = derRead(bytes, id.end, extension.end, s.value);
         let critical = false;
         if (value.tag === 0x01) {
             critical = (value.end > value.start) && (bytes[value.start] !== 0);
-            value = derElement(bytes, value.end, extension.end);
+            value = derRead(bytes, value.end, extension.end, s.value);
         }
         if ((extension.tag !== 0x30) || (id.tag !== 0x06) || (value.tag !== 0x04) || (value.end !== extension.end)) {
             throw new Error('Malformed CRL entry extension');
         }
-        const extnID = oidString(bytes.subarray(id.start, id.end));
-        if (seen.has(extnID)) {
-            problem ??= `Duplicate extension ${extnID}`;
+        // Object identifiers compare as bytes; strings only for messages.
+        const extnID = () => oidString(bytes.subarray(id.start, id.end));
+        for (let i = 0; i < s.ids.length; i += 2) {
+            if (sameRange(bytes, s.ids[i], s.ids[i + 1], id.start, id.end)) {
+                problem ??= `Duplicate extension ${extnID()}`;
+            }
         }
-        seen.add(extnID);
-        if (extnID === '2.5.29.29') {
+        s.ids.push(id.start, id.end);
+        if (sameBytes(bytes, id.start, id.end, OID_CERTIFICATE_ISSUER)) {
             problem ??= 'Indirect CRL certificateIssuer entries are unsupported';
         } else if (critical) {
-            problem ??= `Unsupported critical CRL entry extension ${extnID}`;
-        } else if (extnID === '2.5.29.21') {
-            const reason = derElement(bytes, value.start, value.end);
+            problem ??= `Unsupported critical CRL entry extension ${extnID()}`;
+        } else if (sameBytes(bytes, id.start, id.end, OID_REASON_CODE)) {
+            const reason = derRead(bytes, value.start, value.end, s.reason);
             let code = 0;
             for (let i = reason.start; i < reason.end; i++) {
                 code = (code * 256) + bytes[i];
@@ -114,27 +151,28 @@ function checkEntryExtensions(bytes, list) {
 
 // Walk the revoked entries without decoding them into objects. Structural
 // errors throw; the first unsupported entry is reported for use after the CRL
-// is authenticated. With visit, call visit(bytes, start, end) for each serial
-// instead of checking entry extensions again.
+// is authenticated. With visit, call visit(start, end) for each serial in
+// bytes instead of checking entry extensions again.
 function scanEntries(bytes, entries, visit) {
+    const s = scratch();
     let count = 0;
     let problem;
     for (let offset = entries?.start; offset < entries?.end;) {
-        const entry = derElement(bytes, offset, entries.end);
+        const entry = derRead(bytes, offset, entries.end, s.entry);
         offset = entry.end;
-        const number = derElement(bytes, entry.start, entry.end);
-        const date = derElement(bytes, number.end, entry.end);
+        const number = derRead(bytes, entry.start, entry.end, s.number);
+        const date = derRead(bytes, number.end, entry.end, s.date);
         let next = date.end;
-        if ((entry.tag !== 0x30) || (number.tag !== 0x02) || ! TIME_TAGS.includes(date.tag)) {
+        if ((entry.tag !== 0x30) || (number.tag !== 0x02) || ((date.tag !== 0x17) && (date.tag !== 0x18))) {
             throw new Error('Malformed revoked certificate entry');
         }
         if (next < entry.end) {
-            const extensions = derElement(bytes, next, entry.end);
+            const extensions = derRead(bytes, next, entry.end, s.extensions);
             if (extensions.tag !== 0x30) {
                 throw new Error('Malformed revoked certificate entry');
             }
             if (visit === undefined) {
-                problem ??= checkEntryExtensions(bytes, extensions);
+                problem ??= checkEntryExtensions(bytes, extensions, s);
             }
             next = extensions.end;
         }
@@ -142,9 +180,55 @@ function scanEntries(bytes, entries, visit) {
             throw new Error('Malformed revoked certificate entry');
         }
         count++;
-        visit?.(bytes, number.start, number.end);
+        visit?.(number.start, number.end);
     }
     return { count, problem };
+}
+
+const RSA_PSS = '1.2.840.113549.1.1.10';
+const MGF1 = '1.2.840.113549.1.1.8';
+// Signature algorithms and the issuer key types they need. The hash is
+// checked separately and must be SHA-256, SHA-384 or SHA-512.
+const SIGNATURE_KEY_TYPES = {
+    '1.2.840.113549.1.1.11': [ 'rsa' ],
+    '1.2.840.113549.1.1.12': [ 'rsa' ],
+    '1.2.840.113549.1.1.13': [ 'rsa' ],
+    [RSA_PSS]: [ 'rsa', 'rsa-pss' ],
+    '1.2.840.10045.4.3.2': [ 'ec' ],
+    '1.2.840.10045.4.3.3': [ 'ec' ],
+    '1.2.840.10045.4.3.4': [ 'ec' ]
+};
+
+// Node's synchronous verify hashes the TBS bytes where they are. Web Crypto
+// and asynchronous verification copy them first, which for a CRL of tens of
+// megabytes doubles its memory. X.509 ECDSA signatures are already DER, the
+// form Node expects.
+function crlSignatureValid(tbs, crl, issuerDer, hash) {
+    const algorithm = crl.signatureAlgorithm.algorithmId;
+    const key = new X509Certificate(issuerDer).publicKey;
+    if (! SIGNATURE_KEY_TYPES[algorithm]?.includes(key.asymmetricKeyType)) {
+        return false;
+    }
+    const signature = crl.signatureValue.valueBlock;
+    if (signature.unusedBits) {
+        return false;
+    }
+    let options = key;
+    if (algorithm === RSA_PSS) {
+        const params = new pki.RSASSAPSSParams({ schema: crl.signatureAlgorithm.algorithmParams });
+        const mgfHash = (params.maskGenAlgorithm.algorithmId === MGF1) ?
+            new pki.AlgorithmIdentifier({ schema: params.maskGenAlgorithm.algorithmParams }).algorithmId : undefined;
+        // Node applies MGF1 with the signature hash; nothing else is accepted.
+        if ((mgfHash !== params.hashAlgorithm.algorithmId) || (params.trailerField !== 1)) {
+            throw new Error('Unsupported RSA-PSS parameters in CRL signature');
+        }
+        options = { key, padding: constants.RSA_PKCS1_PSS_PADDING, saltLength: params.saltLength };
+    }
+    try {
+        return verify(hash.replace('-', '').toLowerCase(), tbs, options, signature.valueHexView);
+    } catch (_) {
+        return false;
+    }
 }
 
 function checkDates(thisUpdate, nextUpdate, now) {
@@ -259,15 +343,16 @@ async function authenticateCrl(parsed, issuer) {
         throw new Error('Malformed CRL number');
     }
     // The signature covers the original TBS bytes, including the entries.
-    if (! await cryptoEngine.verifyWithPublicKey(parsed.tbs, crl.signatureValue, issuer.subjectPublicKeyInfo, crl.signatureAlgorithm)) {
+    const issuerDer = certificateDer(issuer);
+    if (! crlSignatureValid(parsed.tbs, crl, issuerDer, hash)) {
         throw new Error('CRL signature verification failed');
     }
     if (parsed.entryProblem) {
         throw new Error(parsed.entryProblem);
     }
     // Only an authenticated CRL is worth indexing.
-    const serials = buildSerialIndex(visit => scanEntries(parsed.bytes, parsed.entries, visit));
-    return new RevocationList({ issuerCertificate: certificateDer(issuer), issuer: crl.issuer, thisUpdate, nextUpdate,
+    const serials = buildSerialIndex(parsed.bytes, visit => scanEntries(parsed.bytes, parsed.entries, visit));
+    return new RevocationList({ issuerCertificate: issuerDer, issuer: crl.issuer, thisUpdate, nextUpdate,
                                 scope: Object.freeze(scope), serials, revokedCount: parsed.revokedCount, size: parsed.size });
 }
 

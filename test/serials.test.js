@@ -16,10 +16,6 @@ function random(seed) {
     };
 }
 
-function index(serials) {
-    return buildSerialIndex(visit => serials.forEach(serial => visit(serial, 0, serial.length)));
-}
-
 // Serials placed at offsets inside one larger buffer, like entries in a CRL.
 function indexFromShared(serials) {
     const bytes = Buffer.concat(serials.flatMap(serial => [ Buffer.from([ 0xee ]), serial ]));
@@ -29,7 +25,11 @@ function indexFromShared(serials) {
         ranges.push([ offset + 1, offset + 1 + serial.length ]);
         offset += 1 + serial.length;
     }
-    return { bytes, index: buildSerialIndex(visit => ranges.forEach(([start, end]) => visit(bytes, start, end))) };
+    return { bytes, index: buildSerialIndex(bytes, visit => ranges.forEach(([start, end]) => visit(start, end))) };
+}
+
+function index(serials) {
+    return indexFromShared(serials).index;
 }
 
 function variants(serial) {
@@ -159,25 +159,39 @@ test('a large index of realistic 16-byte serials finds every member and no neigh
 });
 
 test('an enumeration that changes between the two passes is rejected', function() {
+    const bytes = Buffer.from([ 1, 2, 3 ]);
     let pass = 0;
-    assert.throws(() => buildSerialIndex(function(visit) {
+    assert.throws(() => buildSerialIndex(bytes, function(visit) {
         pass++;
-        visit(Buffer.from([ 1, 2 ]), 0, (pass === 1) ? 2 : 1);
+        visit(0, (pass === 1) ? 2 : 1);
     }), /changed between passes/);
     pass = 0;
-    assert.throws(() => buildSerialIndex(function(visit) {
+    assert.throws(() => buildSerialIndex(bytes, function(visit) {
         pass++;
-        visit(Buffer.from([ 1 ]), 0, 1);
+        visit(0, 1);
         if (pass === 2) {
-            visit(Buffer.from([ 2 ]), 0, 1);
+            visit(1, 2);
         }
     }), /changed between passes/);
     pass = 0;
-    assert.throws(() => buildSerialIndex(function(visit) {
+    assert.throws(() => buildSerialIndex(bytes, function(visit) {
         pass++;
-        visit(Buffer.from([ 1 ]), 0, 1);
+        visit(0, 1);
         if (pass === 1) {
-            visit(Buffer.from([ 2 ]), 0, 1);
+            visit(1, 2);
         }
     }), /changed between passes/);
+});
+
+test('the index owns its memory: no slice of the source buffer or of a shared pool', function() {
+    const serials = [ [ 1 ], [ 2, 3 ], [ 4, 5, 6 ] ].map(x => Buffer.from(x));
+    const { bytes, index: result } = indexFromShared(serials);
+    // The private groups are not reachable; memory accounting and lookups
+    // after the source is overwritten show that nothing refers back to it.
+    bytes.fill(0xff);
+    assert.equal(result.bytes, 6);
+    for (const serial of serials) {
+        assert.equal(result.has(serial), true);
+    }
+    assert.equal(result.has(Buffer.from([ 0xff ])), false);
 });

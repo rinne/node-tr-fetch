@@ -66,20 +66,20 @@ function sameRecord(a, x, b, y, width) {
     return true;
 }
 
-// LSD radix sort of record indices, one stable counting pass per byte
-// position. The work is proportional to the total serial bytes, so no input
-// can make it degrade. Positions where all records agree are skipped.
-function sortRecords(data, width, count) {
-    let order = new Uint32Array(count);
-    let next = new Uint32Array(count);
-    for (let i = 0; i < count; i++) {
-        order[i] = i;
-    }
+// LSD radix sort of serial positions in the source buffer, one stable
+// counting pass per byte position, then a copy of each distinct serial into
+// its own buffer. Sorting the positions avoids an unsorted copy of the
+// serials. The work is proportional to the total serial bytes, so no input
+// can make it degrade. Positions where all serials agree are skipped.
+function sortRecords(bytes, positions, width) {
+    const count = positions.length;
+    let order = positions;
+    let next = new positions.constructor(count);
     const buckets = new Uint32Array(257);
     for (let position = width - 1; (position >= 0) && (count > 1); position--) {
         buckets.fill(0);
         for (let i = 0; i < count; i++) {
-            buckets[data[(order[i] * width) + position] + 1]++;
+            buckets[bytes[order[i] + position] + 1]++;
         }
         if (buckets.includes(count)) {
             continue;
@@ -88,56 +88,56 @@ function sortRecords(data, width, count) {
             buckets[i] += buckets[i - 1];
         }
         for (let i = 0; i < count; i++) {
-            next[buckets[data[(order[i] * width) + position]]++] = order[i];
+            next[buckets[bytes[order[i] + position]]++] = order[i];
         }
         [ order, next ] = [ next, order ];
     }
-    // Own memory for a long-lived cache entry, not a slice of a shared pool.
-    let sorted = Buffer.allocUnsafeSlow(width * count);
+    next = undefined;
     let unique = 0;
     for (let i = 0; i < count; i++) {
-        const from = order[i] * width;
-        if ((unique > 0) && sameRecord(sorted, (unique - 1) * width, data, from, width)) {
-            continue;
+        if ((i === 0) || ! sameRecord(bytes, order[i - 1], bytes, order[i], width)) {
+            unique++;
         }
-        data.copy(sorted, unique * width, from, from + width);
-        unique++;
     }
-    if (unique < count) {
-        const exact = Buffer.allocUnsafeSlow(width * unique);
-        sorted.copy(exact, 0, 0, width * unique);
-        sorted = exact;
+    // Own memory for a long-lived cache entry, not a slice of a shared pool
+    // or of the CRL.
+    const sorted = Buffer.allocUnsafeSlow(width * unique);
+    for (let i = 0, filled = 0; i < count; i++) {
+        if ((i === 0) || ! sameRecord(bytes, order[i - 1], bytes, order[i], width)) {
+            bytes.copy(sorted, filled * width, order[i], order[i] + width);
+            filled++;
+        }
     }
     return { width, count: unique, data: sorted };
 }
 
-// Build an index from forEachSerial(visit), which must call
-// visit(bytes, start, end) for each serial. It is called twice: once to count
-// serials of each length and once to copy them.
-function buildSerialIndex(forEachSerial) {
+// Build an index of serials in bytes. forEachSerial(visit) must call
+// visit(start, end) for each serial; it is called twice, once to count the
+// serials of each length and once to record where they are.
+function buildSerialIndex(bytes, forEachSerial) {
     const counts = new Map();
-    forEachSerial(function(bytes, start, end) {
+    forEachSerial(function(start, end) {
         counts.set(end - start, (counts.get(end - start) ?? 0) + 1);
     });
-    const unsorted = new Map();
+    const Positions = (bytes.length <= 0xffffffff) ? Uint32Array : Float64Array;
+    const located = new Map();
     for (const [width, count] of counts) {
-        unsorted.set(width, { data: Buffer.allocUnsafeSlow(width * count), count, filled: 0 });
+        located.set(width, { positions: new Positions(count), filled: 0 });
     }
-    forEachSerial(function(bytes, start, end) {
-        const group = unsorted.get(end - start);
-        if ((group === undefined) || (group.filled >= group.count)) {
+    forEachSerial(function(start, end) {
+        const group = located.get(end - start);
+        if ((group === undefined) || (group.filled >= group.positions.length)) {
             throw new Error('Serial enumeration changed between passes');
         }
-        bytes.copy(group.data, group.filled * (end - start), start, end);
-        group.filled++;
+        group.positions[group.filled++] = start;
     });
     const groups = new Map();
-    for (const [width] of counts) {
-        const group = unsorted.get(width);
-        if (group.filled !== group.count) {
+    for (const [width, group] of located) {
+        if (group.filled !== group.positions.length) {
             throw new Error('Serial enumeration changed between passes');
         }
-        groups.set(width, sortRecords(group.data, width, group.count));
+        groups.set(width, sortRecords(bytes, group.positions, width));
+        located.set(width, undefined);
     }
     return new SerialIndex(groups);
 }

@@ -234,3 +234,84 @@ test('a revocation list is built only after the CRL authenticates', async functi
         delete require.cache[require.resolve('../crl')];
     }
 });
+
+test('CRL signatures verify for the supported RSA, RSA-PSS and ECDSA algorithms, and tampering fails', async function() {
+    const rsa = name => ({ name, modulusLength: 2048, publicExponent: new Uint8Array([ 1, 0, 1 ]) });
+    for (const [keyAlgorithm, hash, algorithmId] of [
+        [ { name: 'ECDSA', namedCurve: 'P-256' }, 'SHA-256', '1.2.840.10045.4.3.2' ],
+        [ { name: 'ECDSA', namedCurve: 'P-384' }, 'SHA-384', '1.2.840.10045.4.3.3' ],
+        [ { name: 'ECDSA', namedCurve: 'P-521' }, 'SHA-512', '1.2.840.10045.4.3.4' ],
+        [ { ...rsa('RSASSA-PKCS1-v1_5'), hash: 'SHA-256' }, 'SHA-256', '1.2.840.113549.1.1.11' ],
+        [ { ...rsa('RSASSA-PKCS1-v1_5'), hash: 'SHA-384' }, 'SHA-384', '1.2.840.113549.1.1.12' ],
+        [ { ...rsa('RSASSA-PKCS1-v1_5'), hash: 'SHA-512' }, 'SHA-512', '1.2.840.113549.1.1.13' ],
+        [ { ...rsa('RSA-PSS'), hash: 'SHA-256' }, 'SHA-256', '1.2.840.113549.1.1.10' ],
+        [ { ...rsa('RSA-PSS'), hash: 'SHA-384' }, 'SHA-384', '1.2.840.113549.1.1.10' ]
+    ]) {
+        const label = `${keyAlgorithm.name} ${keyAlgorithm.namedCurve ?? ''} ${hash}`;
+        const issuer = await fixtures.certificate({ ca: true, keyAlgorithm, hash });
+        const certificate = await fixtures.certificate({ issuer, serial: 42, hash });
+        const good = await fixtures.crl(issuer, { hash });
+        assert.equal(good.value.signatureAlgorithm.algorithmId, algorithmId, label);
+        assert.equal((await validateCrl(parseCrl(good.der), certificate.cert, issuer.cert, [])).revoked, false, label);
+        const listed = await fixtures.crl(issuer, { hash, serials: [ 42 ] });
+        assert.equal((await validateCrl(parseCrl(listed.der), certificate.cert, issuer.cert, [])).revoked, true, label);
+        for (const offset of [ 30, good.der.length - 10 ]) {
+            const tampered = Buffer.from(good.der);
+            tampered[offset] ^= 0x01;
+            await assert.rejects(validateCrl(parseCrl(tampered), certificate.cert, issuer.cert, []),
+                /signature verification failed|disagree|Malformed|issuer/, `${label} at ${offset}`);
+        }
+    }
+});
+
+test('CRL signature algorithm, key type and parameters must agree', async function() {
+    const data = await fixtures.crl(ca);
+    // An RSA algorithm claimed for an ECDSA issuer key.
+    const mismatched = parseCrl(data.der);
+    const rsaSha256 = new pki.AlgorithmIdentifier({ algorithmId: '1.2.840.113549.1.1.11', algorithmParams: new asn1.Null() });
+    mismatched.crl.signatureAlgorithm = rsaSha256;
+    mismatched.crl.signature = rsaSha256;
+    await assert.rejects(validateCrl(mismatched, leaf.cert, ca.cert, []), /signature verification failed/);
+    // RSA-PSS with MGF1 over a different hash than the signature.
+    const rsaIssuer = await fixtures.certificate({ ca: true, keyAlgorithm: { name: 'RSA-PSS', modulusLength: 2048,
+        publicExponent: new Uint8Array([ 1, 0, 1 ]), hash: 'SHA-256' } });
+    const rsaLeaf = await fixtures.certificate({ issuer: rsaIssuer, serial: 42 });
+    const pss = parseCrl((await fixtures.crl(rsaIssuer)).der);
+    const sha256 = new pki.AlgorithmIdentifier({ algorithmId: '2.16.840.1.101.3.4.2.1', algorithmParams: new asn1.Null() });
+    const sha1 = new pki.AlgorithmIdentifier({ algorithmId: '1.3.14.3.2.26', algorithmParams: new asn1.Null() });
+    const params = new pki.RSASSAPSSParams({ hashAlgorithm: sha256, saltLength: 32,
+        maskGenAlgorithm: new pki.AlgorithmIdentifier({ algorithmId: '1.2.840.113549.1.1.8', algorithmParams: sha1.toSchema() }) });
+    const odd = new pki.AlgorithmIdentifier({ algorithmId: '1.2.840.113549.1.1.10', algorithmParams: params.toSchema() });
+    pss.crl.signatureAlgorithm = odd;
+    pss.crl.signature = odd;
+    await assert.rejects(validateCrl(pss, rsaLeaf.cert, rsaIssuer.cert, []), /Unsupported RSA-PSS parameters/);
+    // A signature BIT STRING with unused bits.
+    const padded = parseCrl(data.der);
+    padded.crl.signatureValue = new asn1.BitString({ valueHex: padded.crl.signatureValue.valueBlock.valueHexView, unusedBits: 1 });
+    await assert.rejects(validateCrl(padded, leaf.cert, ca.cert, []), /signature verification failed/);
+});
+
+test('entry extensions are checked per entry across many entries', async function() {
+    const reason = code => Buffer.from([ 0x30, 0x0a, 0x06, 0x03, 0x55, 0x1d, 0x15, 0x04, 0x03, 0x0a, 0x01, code ]);
+    const entry = (serial, extensions) => {
+        const number = Buffer.from([ 0x02, 0x02, serial >> 8, serial & 0xff ]);
+        const date = Buffer.concat([ Buffer.from([ 0x17, 0x0d ]), Buffer.from('260101000000Z') ]);
+        const list = Buffer.concat([ Buffer.from([ 0x30, extensions.length ]), extensions ]);
+        return Buffer.concat([ Buffer.from([ 0x30, number.length + date.length + list.length ]), number, date, list ]);
+    };
+    // Every entry has a reason code; one per entry is not a duplicate.
+    const entries = Array.from({ length: 2000 }, (_, i) => entry(0x1000 + i, reason(1 + (i % 6))));
+    const many = await fixtures.bulkCrl(ca, 0, { entry: Buffer.concat(entries) });
+    const list = await authenticateCrl(parseCrl(many), ca.cert);
+    assert.equal(list.serials.count, 2000);
+    const late = await fixtures.bulkCrl(ca, 0, { entry: Buffer.concat([ ...entries, entry(0x7000, Buffer.concat([ reason(1), reason(1) ])) ]) });
+    await assert.rejects(authenticateCrl(parseCrl(late), ca.cert), /Duplicate extension 2\.5\.29\.21/);
+    const removed = await fixtures.bulkCrl(ca, 0, { entry: Buffer.concat([ ...entries, entry(0x7001, reason(8)) ]) });
+    await assert.rejects(authenticateCrl(parseCrl(removed), ca.cert), /Invalid revocation reason/);
+    const critical = Buffer.from([ 0x30, 0x0d, 0x06, 0x03, 0x55, 0x1d, 0x15, 0x01, 0x01, 0xff, 0x04, 0x03, 0x0a, 0x01, 0x01 ]);
+    const flagged = await fixtures.bulkCrl(ca, 0, { entry: Buffer.concat([ ...entries, entry(0x7002, critical) ]) });
+    await assert.rejects(authenticateCrl(parseCrl(flagged), ca.cert), /Unsupported critical CRL entry extension 2\.5\.29\.21/);
+    const issuerExtension = Buffer.from([ 0x30, 0x07, 0x06, 0x03, 0x55, 0x1d, 0x1d, 0x04, 0x00 ]);
+    const indirect = await fixtures.bulkCrl(ca, 0, { entry: Buffer.concat([ ...entries, entry(0x7003, issuerExtension) ]) });
+    await assert.rejects(authenticateCrl(parseCrl(indirect), ca.cert), /certificateIssuer entries are unsupported/);
+});

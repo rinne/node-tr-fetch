@@ -20,6 +20,35 @@ function networkUrl(value, kind = 'CRL distribution point') {
     return url;
 }
 
+// Read the body into one buffer as it arrives, instead of collecting chunks
+// and concatenating them, which needs twice the memory at the end. An
+// uncompressed body's Content-Length sizes the buffer up front and lets an
+// oversized download fail before it is read; otherwise the buffer grows.
+// Only the bytes received are ever exposed.
+async function readBody(response, maxBytes, tooLarge) {
+    const declared = response.headers.has('content-encoding') ? NaN : Number(response.headers.get('content-length') ?? NaN);
+    const known = Number.isSafeInteger(declared) && (declared >= 0);
+    if (known && (declared > maxBytes)) {
+        await response.body?.cancel();
+        throw new Error(tooLarge);
+    }
+    let buffer = Buffer.allocUnsafeSlow(known ? declared : Math.min(64 * 1024, maxBytes));
+    let length = 0;
+    for await (const chunk of response.body ?? []) {
+        if ((length + chunk.byteLength) > maxBytes) {
+            throw new Error(tooLarge);
+        }
+        if ((length + chunk.byteLength) > buffer.length) {
+            const grown = Buffer.allocUnsafeSlow(Math.min(maxBytes, Math.max(length + chunk.byteLength, buffer.length * 2)));
+            buffer.copy(grown, 0, 0, length);
+            buffer = grown;
+        }
+        buffer.set(chunk, length);
+        length += chunk.byteLength;
+    }
+    return (length === buffer.length) ? buffer : buffer.subarray(0, length);
+}
+
 async function download(value, signal, body, debug, maxCrlBytes) {
     const kind = (body === undefined) ? 'CRL' : 'OCSP';
     const maxBytes = (body === undefined) ? maxCrlBytes : 1024 * 1024;
@@ -68,20 +97,11 @@ async function download(value, signal, body, debug, maxCrlBytes) {
                 await response.body?.cancel();
                 throw new Error(`${kind} download returned HTTP ${response.status}`);
             }
-            const chunks = [];
-            let length = 0;
-            if (response.body) {
-                for await (const chunk of response.body) {
-                    length += chunk.byteLength;
-                    if (length > maxBytes) {
-                        throw new Error((body === undefined) ? `CRL download exceeds maxCrlBytes (${maxBytes} bytes)` :
-                            'OCSP download exceeds the 1 MiB size limit');
-                    }
-                    chunks.push(chunk);
-                }
-            }
-            debug?.((kind === 'CRL') ? 'CRL fetched' : 'OCSP response fetched', { source: debugUrl(url), bytes: length });
-            return Buffer.concat(chunks, length);
+            const tooLarge = (body === undefined) ? `CRL download exceeds maxCrlBytes (${maxBytes} bytes)` :
+                'OCSP download exceeds the 1 MiB size limit';
+            const result = await readBody(response, maxBytes, tooLarge);
+            debug?.((kind === 'CRL') ? 'CRL fetched' : 'OCSP response fetched', { source: debugUrl(url), bytes: result.length });
+            return result;
         }
         throw new Error(`${kind} download exceeded the five-redirect limit`);
     } finally {

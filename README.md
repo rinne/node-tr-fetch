@@ -80,8 +80,10 @@ await trFetch('https://example.com/', { trFetchCrlPolicy: { maxCrlBytes: 64 * 10
 A larger download is an unreachable distribution point; larger
 `trFetchCrlOverride` data is an invalid CRL. A cached CRL above the caller's
 limit is not used, even if an earlier caller with a higher limit cached it.
-Revoked entries are scanned in place, so memory use while checking stays
-close to the CRL's size; the cache keeps only its serial numbers.
+The CRL is downloaded into a single buffer, verified and scanned in place,
+and only its serial numbers are kept. Peak memory while fetching a CRL is
+roughly three to four times its size, most of it in Node's HTTP stream
+buffering, and is released afterwards.
 
 ### Disabling a check
 
@@ -351,7 +353,8 @@ A successfully authenticated CRL listing the certificate immediately invokes
 the revocation policy; it does not trigger a search for a different answer.
 
 Supported CRLs are direct, complete CRLs with SHA-256, SHA-384 or SHA-512
-signatures supported by PKIjs/Web Crypto, including RSA and ECDSA. Validation
+RSA (PKCS #1 v1.5 or PSS) or ECDSA signatures, verified with Node's crypto
+module. RSA-PSS must use MGF1 with the signature hash. Validation
 checks issuer binding, signature algorithm consistency, `cRLSign` key usage
 when present, authority key identifiers when available, dates and scope.
 `nextUpdate` is required. Matching named issuing distribution points and

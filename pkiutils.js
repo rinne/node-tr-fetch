@@ -19,7 +19,13 @@ function parseDer(bytes, Type) {
 
 // A minimal DER element reader for data too large to decode into an object
 // tree: single-byte tags and definite lengths only, always within bounds.
+// derRead fills and returns a caller-supplied object, so loops over large
+// CRLs create no garbage; derElement returns a new one.
 function derElement(bytes, offset, end = bytes.length) {
+    return derRead(bytes, offset, end, {});
+}
+
+function derRead(bytes, offset, end, element) {
     if ((offset + 2) > end) {
         throw new Error('Malformed ASN.1 data: truncated element');
     }
@@ -43,7 +49,11 @@ function derElement(bytes, offset, end = bytes.length) {
     if ((start + length) > end) {
         throw new Error('Malformed ASN.1 data: element exceeds its container');
     }
-    return { tag, offset, start, end: start + length };
+    element.tag = tag;
+    element.offset = offset;
+    element.start = start;
+    element.end = start + length;
+    return element;
 }
 
 function derHeader(tag, length) {
@@ -99,4 +109,4 @@ function parseCertificate(bytes) {
     return parseDer(bytes, pki.Certificate);
 }
 
-module.exports = { cryptoEngine, parseDer, derElement, derHeader, oidString, extensionsById, extensionValue, parseCertificate };
+module.exports = { cryptoEngine, parseDer, derElement, derRead, derHeader, oidString, extensionsById, extensionValue, parseCertificate };
