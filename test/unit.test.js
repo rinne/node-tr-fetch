@@ -208,3 +208,31 @@ test('system fetch must use the same Undici major version as trFetch', function(
         assert.throws(() => assertCompatibleUndici(bundled), /incompatible with Undici/);
     }
 });
+
+test('every module the package loads is listed in package.json files', function() {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const root = path.join(__dirname, '..');
+    const { files, main, bin } = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
+    // npm always includes package.json itself.
+    const listed = file => (file === 'package.json') || files.some(entry => entry.endsWith('/') ? file.startsWith(entry) : (file === entry));
+    const pending = [ main, ...Object.values(bin) ];
+    const seen = new Set();
+    while (pending.length) {
+        const file = path.normalize(pending.pop());
+        if (seen.has(file)) {
+            continue;
+        }
+        seen.add(file);
+        assert.ok(listed(file), `${file} is not in package.json files`);
+        if (! file.endsWith('.js')) {
+            continue;
+        }
+        const source = fs.readFileSync(path.join(root, file), 'utf8');
+        for (const [, target] of source.matchAll(/require\('(\.{1,2}(?:\/[^']*)?)'\)/g)) {
+            const resolved = path.relative(root, require.resolve(path.join(root, path.dirname(file), target)));
+            pending.push(resolved);
+        }
+    }
+    assert.ok(seen.has('serials.js'));
+});

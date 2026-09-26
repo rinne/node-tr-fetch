@@ -80,8 +80,8 @@ await trFetch('https://example.com/', { trFetchCrlPolicy: { maxCrlBytes: 64 * 10
 A larger download is an unreachable distribution point; larger
 `trFetchCrlOverride` data is an invalid CRL. A cached CRL above the caller's
 limit is not used, even if an earlier caller with a higher limit cached it.
-Revoked entries are scanned in place, so memory use stays close to the CRL's
-size.
+Revoked entries are scanned in place, so memory use while checking stays
+close to the CRL's size; the cache keeps only its serial numbers.
 
 ### Disabling a check
 
@@ -210,8 +210,21 @@ and a matching certificate identifier. Intermediates use their own OCSP URIs.
 
 Fetched and validated CRLs share an in-memory LRU cache within the loaded
 module. Cache keys include the issuer certificate and distribution URL.
-Certificate decisions and failed lookups are never cached. A cached CRL is
-validated against the current certificate and current time on every use.
+Certificate decisions, failed lookups and `trFetchCrlOverride` data are never
+cached.
+
+The cache does not keep the CRL itself. After a CRL is authenticated, its
+revoked serial numbers are stored as sorted fixed-width records, one array per
+serial length, together with the CRL's validity period and scope. Memory is
+about the size of the serial numbers (14 MB for a 43 MB CRL of 875,000
+entries), outside the JavaScript heap, and a lookup is a binary search.
+Serials match only by identical DER bytes.
+
+Checks that depend only on the CRL and its issuer, including the signature,
+run once per download. Checks that depend on the certificate or the time run
+on every use: validity dates, scope and distribution point, the certificate's
+issuer name and signature, and the serial lookup. An entry serves only the
+issuer certificate that authenticated it.
 
 - `trFetchCrlCacheSize` defaults to `32` entries. Any integer **0 or less**
   disables caching for that call.

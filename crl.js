@@ -5,6 +5,7 @@ const pki = require('pkijs');
 const { cryptoEngine, parseDer, derElement, derHeader, oidString, extensionsById, extensionValue,
     parseCertificate } = require('./pkiutils');
 const { DEFAULT_MAX_CRL_BYTES } = require('./options');
+const { buildSerialIndex } = require('./serials');
 
 const TIME_TAGS = [ 0x17, 0x18 ];
 
@@ -113,11 +114,11 @@ function checkEntryExtensions(bytes, list) {
 
 // Walk the revoked entries without decoding them into objects. Structural
 // errors throw; the first unsupported entry is reported for use after the CRL
-// is authenticated. With a serial, also report whether it is listed.
-function scanEntries(bytes, entries, serial) {
+// is authenticated. With visit, call visit(bytes, start, end) for each serial
+// instead of checking entry extensions again.
+function scanEntries(bytes, entries, visit) {
     let count = 0;
     let problem;
-    let revoked = false;
     for (let offset = entries?.start; offset < entries?.end;) {
         const entry = derElement(bytes, offset, entries.end);
         offset = entry.end;
@@ -132,7 +133,7 @@ function scanEntries(bytes, entries, serial) {
             if (extensions.tag !== 0x30) {
                 throw new Error('Malformed revoked certificate entry');
             }
-            if (serial === undefined) {
+            if (visit === undefined) {
                 problem ??= checkEntryExtensions(bytes, extensions);
             }
             next = extensions.end;
@@ -141,29 +142,57 @@ function scanEntries(bytes, entries, serial) {
             throw new Error('Malformed revoked certificate entry');
         }
         count++;
-        if ((serial !== undefined) && bytes.subarray(number.start, number.end).equals(serial)) {
-            revoked = true;
-        }
+        visit?.(bytes, number.start, number.end);
     }
-    return { count, problem, revoked };
+    return { count, problem };
 }
 
-function checkValidity(crl, now = Date.now()) {
-    const start = crl.thisUpdate.value.getTime();
-    const end = crl.nextUpdate?.value.getTime();
-    if (! Number.isFinite(start) || ! Number.isFinite(end) || (end <= start)) {
-        throw new Error('CRL must have a valid thisUpdate and a later nextUpdate');
-    }
-    if (start > now) {
+function checkDates(thisUpdate, nextUpdate, now) {
+    if (thisUpdate > now) {
         throw new Error('CRL is not yet valid (thisUpdate is in the future)');
     }
-    if (end <= now) {
+    if (nextUpdate <= now) {
         throw new Error('CRL has expired (nextUpdate has passed)');
     }
-    return end;
 }
 
-function checkScope(crl, certificate, urls) {
+function certificateDer(certificate) {
+    return Buffer.from(certificate.toSchema().toBER());
+}
+
+// An authenticated CRL reduced to what checking a certificate needs: the
+// revoked serials, the validity period and the scope. It does not retain the
+// CRL itself, and serves only certificates of the issuer that signed it.
+class RevocationList {
+    #issuerCertificate;
+
+    constructor(fields) {
+        this.#issuerCertificate = fields.issuerCertificate;
+        this.issuer = fields.issuer;
+        this.thisUpdate = fields.thisUpdate;
+        this.nextUpdate = fields.nextUpdate;
+        this.scope = fields.scope;
+        this.serials = fields.serials;
+        this.revokedCount = fields.revokedCount;
+        this.size = fields.size;
+        Object.freeze(this);
+    }
+
+    signedBy(issuer) {
+        return certificateDer(issuer).equals(this.#issuerCertificate);
+    }
+}
+
+// Everything that depends only on the CRL and its issuer: structure, scope
+// support, issuer binding, signing permission, algorithms and the signature.
+// Runs once per downloaded CRL; the result can be cached for the issuer.
+async function authenticateCrl(parsed, issuer) {
+    const crl = parsed.crl;
+    const thisUpdate = crl.thisUpdate.value.getTime();
+    const nextUpdate = crl.nextUpdate?.value.getTime();
+    if (! Number.isFinite(thisUpdate) || ! Number.isFinite(nextUpdate) || (nextUpdate <= thisUpdate)) {
+        throw new Error('CRL must have a valid thisUpdate and a later nextUpdate');
+    }
     if (! [ 0, 1 ].includes(crl.version)) {
         throw new Error('Unsupported CRL version');
     }
@@ -176,36 +205,24 @@ function checkScope(crl, certificate, urls) {
             throw new Error(`Unsupported critical CRL extension ${extension.extnID}`);
         }
     }
+    const scope = { onlyUserCertificates: false, onlyCaCertificates: false, distributionPoints: undefined };
     const idpExtension = extensions.get('2.5.29.28');
     if (idpExtension) {
         const idp = extensionValue(idpExtension, pki.IssuingDistributionPoint);
         if (idp.indirectCRL || (idp.onlySomeReasons !== undefined) || idp.onlyContainsAttributeCerts) {
             throw new Error('Indirect, reason-limited and attribute-certificate CRLs are unsupported');
         }
-        const basic = extensionsById(certificate.extensions).get('2.5.29.19');
-        const isCA = basic ? extensionValue(basic, pki.BasicConstraints).cA : false;
-        if ((idp.onlyContainsUserCerts && isCA) || (idp.onlyContainsCACerts && ! isCA)) {
-            throw new Error('CRL scope does not cover this certificate type');
-        }
+        scope.onlyUserCertificates = !! idp.onlyContainsUserCerts;
+        scope.onlyCaCertificates = !! idp.onlyContainsCACerts;
         if (idp.distributionPoint !== undefined) {
-            if (! Array.isArray(idp.distributionPoint) ||
-                ! idp.distributionPoint.some(x => (x.type === 6) && urls.includes(x.value))) {
-                throw new Error('CRL issuing distribution point does not match the effective distribution point');
-            }
+            // Only URI names can match; other name forms never do.
+            scope.distributionPoints = Array.isArray(idp.distributionPoint) ?
+                idp.distributionPoint.filter(x => x.type === 6).map(x => x.value) : [];
         }
     }
-    return extensions;
-}
-
-async function validateCrl(parsed, certificate, issuer, urls, now = Date.now()) {
-    const crl = parsed.crl;
-    const nextUpdate = checkValidity(crl, now);
-    const extensions = checkScope(crl, certificate, urls);
-    if (! crl.issuer.isEqual(certificate.issuer) || ! crl.issuer.isEqual(issuer.subject)) {
+    Object.freeze(scope.distributionPoints);
+    if (! crl.issuer.isEqual(issuer.subject)) {
         throw new Error('CRL issuer does not match the certificate issuer');
-    }
-    if (! await certificate.verify(issuer, cryptoEngine)) {
-        throw new Error('CRL signing certificate did not issue the checked certificate');
     }
     if (! Buffer.from(crl.signature.toSchema().toBER()).equals(Buffer.from(crl.signatureAlgorithm.toSchema().toBER()))) {
         throw new Error('CRL signature algorithm identifiers disagree');
@@ -248,10 +265,42 @@ async function validateCrl(parsed, certificate, issuer, urls, now = Date.now()) 
     if (parsed.entryProblem) {
         throw new Error(parsed.entryProblem);
     }
-    const serial = Buffer.from(certificate.serialNumber.valueBlock.valueHexView);
-    const { revoked } = scanEntries(parsed.bytes, parsed.entries, serial);
-    checkValidity(crl);
-    return { revoked, nextUpdate };
+    // Only an authenticated CRL is worth indexing.
+    const serials = buildSerialIndex(visit => scanEntries(parsed.bytes, parsed.entries, visit));
+    return new RevocationList({ issuerCertificate: certificateDer(issuer), issuer: crl.issuer, thisUpdate, nextUpdate,
+                                scope: Object.freeze(scope), serials, revokedCount: parsed.revokedCount, size: parsed.size });
 }
 
-module.exports = { parseCertificate, distributionPoints, parseCrl, validateCrl };
+// Everything that depends on the checked certificate or the current time.
+// Runs on every use, including for cached lists.
+async function checkRevocationList(list, certificate, issuer, urls, now = Date.now()) {
+    if (! list.signedBy(issuer)) {
+        throw new Error('CRL was authenticated for a different issuer certificate');
+    }
+    checkDates(list.thisUpdate, list.nextUpdate, now);
+    const basic = extensionsById(certificate.extensions).get('2.5.29.19');
+    const isCA = basic ? extensionValue(basic, pki.BasicConstraints).cA : false;
+    if ((list.scope.onlyUserCertificates && isCA) || (list.scope.onlyCaCertificates && ! isCA)) {
+        throw new Error('CRL scope does not cover this certificate type');
+    }
+    if ((list.scope.distributionPoints !== undefined) && ! list.scope.distributionPoints.some(x => urls.includes(x))) {
+        throw new Error('CRL issuing distribution point does not match the effective distribution point');
+    }
+    if (! list.issuer.isEqual(certificate.issuer)) {
+        throw new Error('CRL issuer does not match the certificate issuer');
+    }
+    if (! await certificate.verify(issuer, cryptoEngine)) {
+        throw new Error('CRL signing certificate did not issue the checked certificate');
+    }
+    const revoked = list.serials.has(Buffer.from(certificate.serialNumber.valueBlock.valueHexView));
+    // Checks above can take time; the list must still be valid now.
+    checkDates(list.thisUpdate, list.nextUpdate, Date.now());
+    return { revoked, nextUpdate: list.nextUpdate };
+}
+
+async function validateCrl(parsed, certificate, issuer, urls, now = Date.now()) {
+    return checkRevocationList(await authenticateCrl(parsed, issuer), certificate, issuer, urls, now);
+}
+
+module.exports = { RevocationList, parseCertificate, distributionPoints, parseCrl, authenticateCrl, checkRevocationList,
+    validateCrl };

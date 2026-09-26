@@ -316,6 +316,30 @@ test('maxCrlBytes limits CRL downloads, override data and cached CRLs, and can b
     await (await trFetch(small.url, { trFetchCrlOverride: goodCrl.der, trFetchCrlPolicy: { maxCrlBytes: goodCrl.der.length } })).text();
 });
 
+test('a cached revocation list answers for other certificates of the same issuer without a download', async function(t) {
+    routes.set('/shared', revokedCrl.der);
+    const count = () => crlRequests.filter(x => x.url === '/shared').length;
+    const good = await endpoint(t, { urls: [ crlBase + '/shared' ], serial: 41 });
+    const revoked = await endpoint(t, { urls: [ crlBase + '/shared' ], serial: 42 });
+    const events = captureDebug(t);
+    await (await trFetch(good.url, { trFetchDebug: true, trFetchOcspPolicy: { disabled: true } })).text();
+    assert.equal(count(), 1);
+    const indexed = events.find(x => x.event === 'CRL authenticated and indexed');
+    assert.equal(indexed.serials, 1);
+    assert.equal(indexed.indexBytes, 1);
+    events.length = 0;
+    await assert.rejects(trFetch(revoked.url, { trFetchDebug: true, trFetchOcspPolicy: { disabled: true } }),
+        crlError('TR_FETCH_CERTIFICATE_REVOKED', /Revoked server certificate/));
+    assert.equal(count(), 1);
+    assert.equal(revoked.hits(), 0);
+    assert.ok(events.some(x => x.event === 'CRL cache hit'));
+    assert.ok(! events.some(x => [ 'CRL fetched', 'CRL parsed', 'CRL authenticated and indexed' ].includes(x.event)));
+    t.mock.restoreAll();
+    await (await trFetch(good.url, { trFetchOcspPolicy: { disabled: true } })).text();
+    assert.equal(count(), 1);
+    assert.equal(good.hits(), 2);
+});
+
 test('CRL cache is shared, TTL zero and nonpositive sizes bypass it', async function(t) {
     routes.set('/cache', goodCrl.der);
     const server = await endpoint(t, { urls: [ crlBase + '/cache' ] });

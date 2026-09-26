@@ -7,8 +7,9 @@ function cacheEntry(key) {
     return { issuer: key.slice(0, separator), source: debugUrl(key.slice(separator + 1)) };
 }
 
-// Cache verified CRLs, never a policy decision or a failed lookup. A caller's
-// shorter TTL also applies to entries populated by an earlier caller.
+// Cache authenticated revocation lists (see RevocationList in crl.js), never
+// a policy decision, a failed lookup or the CRL bytes. A caller's shorter TTL
+// also applies to entries populated by an earlier caller.
 class CrlCache {
     #entries = new Map();
 

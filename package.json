@@ -21,6 +21,7 @@
         "ocsp.js",
         "options.js",
         "pkiutils.js",
+        "serials.js",
         "transport.js",
         "bin/",
         "tr-curl/"
