@@ -1,0 +1,66 @@
+{
+    "name": "tr-fetch",
+    "version": "0.9.0",
+    "description": "Node.js fetch with CRL and OCSP certificate revocation checking, plus tr-curl, a curl-like test tool",
+    "main": "index.js",
+    "exports": {
+        ".": "./index.js",
+        "./package.json": "./package.json"
+    },
+    "bin": {
+        "tr-curl": "bin/tr-curl.js"
+    },
+    "files": [
+        "index.js",
+        "cache.js",
+        "check.js",
+        "crl.js",
+        "debug.js",
+        "download.js",
+        "errors.js",
+        "ocsp.js",
+        "options.js",
+        "pkiutils.js",
+        "transport.js",
+        "bin/",
+        "tr-curl/"
+    ],
+    "scripts": {
+        "test": "node --test test/*.test.js"
+    },
+    "engines": {
+        "node": ">=26.0.0"
+    },
+    "dependencies": {
+        "asn1js": "^3.0.10",
+        "optist": "^2.0.1",
+        "pkijs": "^3.4.1",
+        "undici": "^8.11.2"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/rinne/node-tr-fetch.git"
+    },
+    "keywords": [
+        "fetch",
+        "https",
+        "tls",
+        "x509",
+        "certificate",
+        "revocation",
+        "crl",
+        "ocsp",
+        "curl",
+        "security"
+    ],
+    "author": {
+        "name": "Timo J. Rinne",
+        "email": "tri@iki.fi",
+        "url": "https://github.com/rinne/"
+    },
+    "license": "MIT",
+    "bugs": {
+        "url": "https://github.com/rinne/node-tr-fetch/issues"
+    },
+    "homepage": "https://github.com/rinne/node-tr-fetch#readme"
+}
