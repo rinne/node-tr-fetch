@@ -87,7 +87,7 @@ test('defaults, partial policy and stripping without mutating caller options', f
     assert.equal(splitOptions().policy.crlCacheTTL, 1800);
     assert.equal(splitOptions().policy.crlCheckDepth, 0);
     assert.deepEqual(Object.keys(splitOptions()).sort(), [ 'crl', 'debugEnabled', 'distributionPoint', 'fetchOptions', 'ocspPolicy',
-        'ocspUri', 'policy' ]);
+        'ocspUri', 'policy', 'warningCb' ]);
 });
 
 test('cache sizes, TTL and check depths are policy settings; the former top-level options are unknown', function() {
@@ -352,4 +352,73 @@ test('per-certificate CRL results: refreshes are not uses, and the cache can be 
     }
     cache.remove('d');
     assert.equal(cache.lookup('d', 2, -1, 10, 1007), undefined);
+});
+
+test('trFetchWarningCb must be a function and is removed before system fetch', function() {
+    for (const cb of [ () => {}, function() {}, async function() {}, class Warned {} ]) {
+        const result = splitOptions({ trFetchWarningCb: cb, method: 'GET' });
+        assert.equal(result.warningCb, cb);
+        assert.deepEqual(result.fetchOptions, { method: 'GET' });
+    }
+    assert.equal(splitOptions().warningCb, undefined);
+    for (const cb of [ null, 0, 1, 'console.log', {}, [], true, Symbol('cb') ]) {
+        assert.throws(() => splitOptions({ trFetchWarningCb: cb }), /trFetchWarningCb must be a function/);
+    }
+});
+
+test('warning callbacks are fire and forget: never awaited, and their failures only reported', async function(t) {
+    const { callbackFireAndForget } = require('../errors');
+    const reported = [];
+    t.mock.method(console, 'warn', error => reported.push(error));
+    const calls = [];
+    const result = callbackFireAndForget((...args) => calls.push(args), 'a', 1);
+    // The callback starts at once; its outcome is never waited for.
+    assert.equal(result, undefined);
+    assert.deepEqual(calls, [ [ 'a', 1 ] ]);
+    let settled = false;
+    callbackFireAndForget(() => new Promise(resolve => setTimeout(resolve, 50)).then(() => {
+        settled = true;
+    }));
+    assert.equal(settled, false);
+    const thrown = new Error('thrown');
+    const rejected = new Error('rejected');
+    assert.doesNotThrow(() => callbackFireAndForget(() => {
+        throw thrown;
+    }));
+    callbackFireAndForget(async () => {
+        throw rejected;
+    });
+    callbackFireAndForget('not a function');
+    callbackFireAndForget(class NotCallable {});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(reported.length, 4);
+    assert.ok(reported.includes(thrown) && reported.includes(rejected));
+    assert.equal(reported.filter(x => /Callback not callable/.test(x.message)).length, 1);
+    assert.equal(reported.filter(x => (x instanceof TypeError) && ! /Callback not callable/.test(x.message)).length, 1);
+});
+
+test('applyPolicy delivers warnings to the callback instead of process warnings', async function(t) {
+    const { applyPolicy, TrFetchCrlError, TrFetchOcspError } = require('../errors');
+    const emitted = [];
+    t.mock.method(process, 'emitWarning', warning => emitted.push(warning));
+    const delivered = [];
+    const cb = warning => delivered.push(warning);
+    const crl = () => new TrFetchCrlError('invalidCrl', 'bad CRL', { hostname: 'example.com', serialNumber: '2A' });
+    const ocsp = () => new TrFetchOcspError('rejectedCertificate', 'unknown status', { hostname: 'example.com', ocspStatus: 'unknown' });
+    applyPolicy({ invalidCrl: 'warn' }, crl(), undefined, cb);
+    applyPolicy({ rejectedCertificate: 'warn' }, ocsp(), undefined, cb);
+    applyPolicy({ invalidCrl: 'ignore' }, crl(), undefined, cb);
+    assert.throws(() => applyPolicy({ invalidCrl: 'reject' }, crl(), undefined, cb), { code: 'TR_FETCH_CRL_INVALID' });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(emitted.length, 0);
+    assert.deepEqual(delivered.map(x => [ x.name, x.code, x.message, x.hostname ]), [
+        [ 'TrFetchCrlWarning', 'TR_FETCH_CRL_INVALID', 'trFetch: bad CRL', 'example.com' ],
+        [ 'TrFetchOcspWarning', 'TR_FETCH_OCSP_CERTIFICATE_REJECTED', 'trFetch: unknown status', 'example.com' ]
+    ]);
+    assert.equal(delivered[0].serialNumber, '2A');
+    assert.equal(delivered[1].ocspStatus, 'unknown');
+    assert.ok(delivered[0] instanceof TrFetchCrlError);
+    applyPolicy({ invalidCrl: 'warn' }, crl());
+    assert.equal(emitted.length, 1);
+    assert.equal(emitted[0].name, 'TrFetchCrlWarning');
 });

@@ -343,7 +343,25 @@ process.on('warning', function(warning) {
 ```
 
 Warnings use the same codes and context, with the names `TrFetchCrlWarning`
-and `TrFetchOcspWarning`.
+and `TrFetchOcspWarning`. They are Node.js process warnings unless the
+`trFetchWarningCb` option is given, in which case each warning goes to that
+function instead:
+
+```js
+const response = await trFetch(url, {
+	trFetchCrlPolicy: { missingCrlDistributionPoint: 'warn' },
+	trFetchWarningCb: warning => log.warn({ request: requestId, code: warning.code }, warning.message)
+});
+```
+
+The callback receives only the warning; context comes with it as a closure,
+like `requestId` above. It is purely informational and fire-and-forget: it is
+called when the warning arises and never awaited, so it cannot delay, change
+or abort the fetch. If it throws or returns a rejected promise, the error is
+reported with `console.warn` and otherwise ignored. A value that is not a
+function rejects with `TypeError`, and the option is removed before calling
+system fetch.
+
 Normal TLS/network failures keep native fetch's error behavior. Cancellation
 preserves the caller's abort reason.
 

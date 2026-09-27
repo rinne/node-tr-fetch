@@ -26,7 +26,7 @@ const DEFAULT_OCSP_POLICY = {
 
 const CUSTOM_OPTIONS = [
     'trFetchCrlPolicy', 'trFetchCrlDistributionPointOverride', 'trFetchCrlOverride',
-    'trFetchOcspPolicy', 'trFetchOcspUriOverride', 'trFetchDebug'
+    'trFetchOcspPolicy', 'trFetchOcspUriOverride', 'trFetchDebug', 'trFetchWarningCb'
 ];
 
 const FETCH_OPTIONS = [
@@ -124,6 +124,12 @@ function splitOptions(options) {
     if (typeof(debugEnabled) !== 'boolean') {
         throw new TypeError('trFetchDebug must be a boolean');
     }
+    // Receives policy warnings instead of process.emitWarning; a fire-and-
+    // forget notification whose outcome never affects the fetch.
+    const warningCb = fetchOptions.trFetchWarningCb;
+    if ((warningCb !== undefined) && (typeof(warningCb) !== 'function')) {
+        throw new TypeError('trFetchWarningCb must be a function');
+    }
     const policy = parsePolicy(fetchOptions.trFetchCrlPolicy, DEFAULT_POLICY, 'trFetchCrlPolicy');
     const ocspPolicy = parsePolicy(fetchOptions.trFetchOcspPolicy, DEFAULT_OCSP_POLICY, 'trFetchOcspPolicy');
     let ocspUri = fetchOptions.trFetchOcspUriOverride;
@@ -161,7 +167,7 @@ function splitOptions(options) {
     if (fetchOptions.dispatcher !== undefined) {
         throw new TypeError('trFetch cannot safely combine CRL checking with a custom dispatcher');
     }
-    return { fetchOptions, policy, distributionPoint, crl, ocspPolicy, ocspUri, debugEnabled };
+    return { fetchOptions, policy, distributionPoint, crl, ocspPolicy, ocspUri, debugEnabled, warningCb };
 }
 
 module.exports = { DEFAULT_MAX_CRL_BYTES, splitOptions };

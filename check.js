@@ -52,11 +52,11 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
             }
         }
     } catch (cause) {
-        applyPolicy(options.policy, issue('invalidCrl', `Cannot read certificate CRL information: ${cause.message}`, cause), debug);
+        applyPolicy(options.policy, issue('invalidCrl', `Cannot read certificate CRL information: ${cause.message}`, cause), debug, options.warningCb);
         return;
     }
     if (points === undefined) {
-        applyPolicy(options.policy, issue('missingCrlDistributionPoint', 'Missing CRL distribution point'), debug);
+        applyPolicy(options.policy, issue('missingCrlDistributionPoint', 'Missing CRL distribution point'), debug, options.warningCb);
         return;
     }
     let issuer;
@@ -66,7 +66,7 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
         }
         issuer = parseCertificate(peer.issuerCertificate.raw);
     } catch (cause) {
-        applyPolicy(options.policy, issue('invalidCrl', `Cannot authenticate CRL: ${cause.message}`, cause), debug);
+        applyPolicy(options.policy, issue('invalidCrl', `Cannot authenticate CRL: ${cause.message}`, cause), debug, options.warningCb);
         return;
     }
     const issuerId = createHash('sha256').update(peer.issuerCertificate.raw).digest('hex');
@@ -233,7 +233,7 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
                                                      policy: 'revokedCertificate', configuredAction: options.policy.revokedCertificate,
                                                      action: result.revoked ? options.policy.revokedCertificate : 'continue', nextUpdate: result.nextUpdate });
             if (result.revoked) {
-                applyPolicy(options.policy, issue('revokedCertificate', `Revoked ${certificateType} certificate: serial number is listed in the authenticated CRL`, undefined, source), debug);
+                applyPolicy(options.policy, issue('revokedCertificate', `Revoked ${certificateType} certificate: serial number is listed in the authenticated CRL`, undefined, source), debug, options.warningCb);
             }
             return result.nextUpdate;
         }
@@ -242,7 +242,7 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
         }
     }
     for (const failure of failures) {
-        applyPolicy(options.policy, failure, debug);
+        applyPolicy(options.policy, failure, debug, options.warningCb);
     }
 }
 
@@ -303,11 +303,11 @@ async function checkChain(peer, hostname, options, signal) {
         peer = issuer;
     }
     if (Date.now() >= nextUpdate) {
-        applyPolicy(options.policy, new TrFetchCrlError('invalidCrl', 'CRL expired while checking the certificate chain', { hostname }), debug);
+        applyPolicy(options.policy, new TrFetchCrlError('invalidCrl', 'CRL expired while checking the certificate chain', { hostname }), debug, options.warningCb);
     }
     if (Date.now() >= ocspNextUpdate) {
         applyPolicy(options.ocspPolicy, new TrFetchOcspError('rejectedCertificate',
-                                                             'OCSP response expired while checking the certificate chain', { hostname, ocspStatus: 'invalid-response' }), debug);
+                                                             'OCSP response expired while checking the certificate chain', { hostname, ocspStatus: 'invalid-response' }), debug, options.warningCb);
     }
     debug?.('Revocation checks completed; connection allowed', { hostname });
 }

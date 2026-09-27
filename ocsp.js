@@ -209,11 +209,11 @@ async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug
             });
         }
     } catch (cause) {
-        applyPolicy(policy, issue('rejectedCertificate', `Cannot read OCSP certificate information: ${cause.message}`, undefined, cause, 'invalid-response'), debug);
+        applyPolicy(policy, issue('rejectedCertificate', `Cannot read OCSP certificate information: ${cause.message}`, undefined, cause, 'invalid-response'), debug, options.warningCb);
         return;
     }
     if (! uris.length) {
-        applyPolicy(policy, issue('missingOcspUri', 'Missing OCSP responder URI'), debug);
+        applyPolicy(policy, issue('missingOcspUri', 'Missing OCSP responder URI'), debug, options.warningCb);
         return;
     }
     try {
@@ -223,7 +223,7 @@ async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug
         issuer = parseCertificate(peer.issuerCertificate.raw);
         request = await createOcspRequest(certificate, issuer);
     } catch (cause) {
-        applyPolicy(policy, issue('rejectedCertificate', `Cannot prepare OCSP verification: ${cause.message}`, undefined, cause, 'invalid-response'), debug);
+        applyPolicy(policy, issue('rejectedCertificate', `Cannot prepare OCSP verification: ${cause.message}`, undefined, cause, 'invalid-response'), debug, options.warningCb);
         return;
     }
     const failures = [];
@@ -250,7 +250,8 @@ async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug
                                                    action: (result.status === 'good') ? 'continue' : policy.rejectedCertificate, nextUpdate: result.nextUpdate });
         if (result.status !== 'good') {
             applyPolicy(policy, issue('rejectedCertificate',
-                                      `OCSP rejected certificate: responder reports ${result.status}`, uri, undefined, result.status), responderDebug);
+                                      `OCSP rejected certificate: responder reports ${result.status}`, uri, undefined, result.status), responderDebug,
+                        options.warningCb);
         }
         return result.nextUpdate;
     }
@@ -258,7 +259,7 @@ async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug
         failures.push(issue('unreachableOcspUri', 'OCSP responder URI lookup limit (32) exceeded'));
     }
     for (const failure of failures) {
-        applyPolicy(policy, failure, debug);
+        applyPolicy(policy, failure, debug, options.warningCb);
     }
 }
 

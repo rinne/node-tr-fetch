@@ -234,6 +234,46 @@ test('missing distribution point: ignore by default, reject or warn on request',
     assert.equal(warnings[0].code, 'TR_FETCH_CRL_MISSING_DISTRIBUTION_POINT');
 });
 
+test('trFetchWarningCb receives CRL and OCSP warnings instead of process warnings, and cannot affect the fetch', async function(t) {
+    routes.set('/cb-ocsp-revoked', ocspRoute(ca, { status: 'revoked' }));
+    const server = await endpoint(t, { ocspUrls: [ crlBase + '/cb-ocsp-revoked' ] });
+    const emitted = [];
+    t.mock.method(process, 'emitWarning', warning => emitted.push(warning));
+    const reported = [];
+    t.mock.method(console, 'warn', error => reported.push(error));
+    const options = { trFetchCrlPolicy: { missingCrlDistributionPoint: 'warn' }, trFetchOcspPolicy: { rejectedCertificate: 'warn' } };
+    const delivered = [];
+    // Context, like the request, comes with the callback as a closure.
+    const request = 'first';
+    assert.equal(await (await trFetch(server.url, { ...options, trFetchWarningCb: warning => delivered.push([ request, warning ]) })).text(), 'ok');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(emitted.length, 0);
+    assert.deepEqual(delivered.map(([context, warning]) => [ context, warning.name, warning.code ]), [
+        [ 'first', 'TrFetchCrlWarning', 'TR_FETCH_CRL_MISSING_DISTRIBUTION_POINT' ],
+        [ 'first', 'TrFetchOcspWarning', 'TR_FETCH_OCSP_CERTIFICATE_REJECTED' ]
+    ]);
+    assert.equal(delivered[1][1].ocspStatus, 'revoked');
+    assert.equal(delivered[1][1].hostname, 'localhost');
+    assert.equal(delivered[1][1].serialNumber, '2A');
+    // A callback that throws or rejects is reported, never propagated.
+    for (const trFetchWarningCb of [ () => {
+        throw new Error('callback threw');
+    }, async () => {
+        throw new Error('callback rejected');
+    }, () => new Promise(() => {}) ]) {
+        assert.equal(await (await trFetch(server.url, { ...options, trFetchWarningCb })).text(), 'ok');
+    }
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(reported.map(x => x.message), [ 'callback threw', 'callback threw', 'callback rejected', 'callback rejected' ]);
+    assert.equal(emitted.length, 0);
+    // Rejections are unaffected by the callback.
+    await assert.rejects(trFetch(server.url, { trFetchWarningCb: () => {}, trFetchCrlPolicy: { missingCrlDistributionPoint: 'reject' } }),
+        { code: 'TR_FETCH_CRL_MISSING_DISTRIBUTION_POINT' });
+    // Without a callback, warnings are process warnings as before.
+    await (await trFetch(server.url, options)).text();
+    assert.equal(emitted.length, 2);
+});
+
 test('warn and ignore for revocation remain distinct from invalid CRL policy', async function(t) {
     const server = await endpoint(t, { urls: [ crlBase + '/revoked' ] });
     const warnings = [];
