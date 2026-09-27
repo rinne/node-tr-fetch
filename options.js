@@ -5,10 +5,10 @@ const DEFAULT_MAX_CRL_BYTES = 16 * 1024 * 1024;
 const DEFAULT_POLICY = {
     disabled: false,
     maxCrlBytes: DEFAULT_MAX_CRL_BYTES,
-    crlCacheScope: 'crl',
+    crlCacheScope: 'certificate',
     crlCacheSize: 32,
     crlCertificateCacheSize: 1024,
-    crlCacheTTL: 1800,
+    crlCacheTTL: 86400,
     crlCheckDepth: 0,
     missingCrlDistributionPoint: 'ignore',
     unreachableCrlDistributionPoint: 'reject',
@@ -19,7 +19,7 @@ const DEFAULT_POLICY = {
 const DEFAULT_OCSP_POLICY = {
     disabled: false,
     ocspCacheSize: 1024,
-    ocspCacheTTL: 1800,
+    ocspCacheTTL: 86400,
     ocspCheckDepth: 0,
     missingOcspUri: 'ignore',
     unreachableOcspUri: 'reject',

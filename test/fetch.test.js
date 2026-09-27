@@ -85,6 +85,12 @@ function crlError(code, message) {
 // check would not run.
 const bothChecks = { trFetchCertificateRevocationPolicy: { strategy: 'both' } };
 
+// A trFetch for tests of the whole-CRL cache, crlCacheScope 'crl', which is
+// not the default. Explicit CRL policy settings still apply.
+const trFetchCrlScope = Object.assign(function(input, options = {}) {
+    return trFetch(input, { ...options, trFetchCrlPolicy: { crlCacheScope: 'crl', ...options.trFetchCrlPolicy } });
+}, trFetch);
+
 function captureDebug(t) {
     const events = [];
     const write = process.stderr.write.bind(process.stderr);
@@ -98,6 +104,7 @@ function captureDebug(t) {
 }
 
 test('debug traces CRL/OCSP discovery, authenticated results and cache use without logging request secrets', async function(t) {
+    const trFetch = trFetchCrlScope;
     routes.set('/debug-crl?token=crl-secret', goodCrl.der);
     routes.set('/debug-ocsp?token=ocsp-secret', ocspRoute(ca));
     const server = await endpoint(t, {
@@ -344,6 +351,7 @@ test('default TLS trust, validity and hostname checks cannot be relaxed by CRL p
 });
 
 test('maxCrlBytes limits CRL downloads, override data and cached CRLs, and can be raised', async function(t) {
+    const trFetch = trFetchCrlScope;
     const big = await fixtures.bulkCrl(ca, 800000, { serials: [ 42 ] });
     assert.ok(big.length > 16 * 1024 * 1024);
     routes.set('/big.crl', big);
@@ -365,6 +373,7 @@ test('maxCrlBytes limits CRL downloads, override data and cached CRLs, and can b
 });
 
 test('a cached revocation list answers for other certificates of the same issuer without a download', async function(t) {
+    const trFetch = trFetchCrlScope;
     routes.set('/shared', revokedCrl.der);
     const count = () => crlRequests.filter(x => x.url === '/shared').length;
     const good = await endpoint(t, { urls: [ crlBase + '/shared' ], serial: 41 });
@@ -502,7 +511,7 @@ test('crlCertificateCacheSize limits per-certificate results separately from crl
     await (await trFetch(b.url, byCertificate({ trFetchCrlPolicy: { crlCacheTTL: 1 } }))).text();
     assert.equal(count(), 8);
     // And the per-certificate size does not limit the whole-CRL cache.
-    const crlScope = { trFetchCrlPolicy: { crlCertificateCacheSize: 0 }, trFetchOcspPolicy: { disabled: true } };
+    const crlScope = { trFetchCrlPolicy: { crlCacheScope: 'crl', crlCertificateCacheSize: 0 }, trFetchOcspPolicy: { disabled: true } };
     await (await trFetch(a.url, crlScope)).text();
     await (await trFetch(b.url, crlScope)).text();
     assert.equal(count(), 9);
@@ -536,6 +545,7 @@ test('certificate scope: an older CRL never replaces a newer result, and a chang
 });
 
 test('CRL cache is shared, TTL zero and nonpositive sizes bypass it', async function(t) {
+    const trFetch = trFetchCrlScope;
     routes.set('/cache', goodCrl.der);
     const server = await endpoint(t, { urls: [ crlBase + '/cache' ] });
     const count = () => crlRequests.filter(x => x.url === '/cache').length;
@@ -656,8 +666,12 @@ test('replaced system fetch that bypasses the verifying dispatcher fails closed'
         assert.equal(server.hits(), 1);
         assert.equal(await (await trFetch('data:,inline')).text(), 'inline');
     });
-    // The final response must also come from a verified connection.
+    // The final response must also come from a verified connection. CRL
+    // downloads pass through; bypassed downloads are tested separately.
     await withSystemFetch(original => async function(input, init) {
+        if (String(input instanceof Request ? input.url : input).startsWith(crlBase)) {
+            return original(input, init);
+        }
         await (await original(input, init)).text();
         return original(server.url + '/elsewhere');
     }, async function() {

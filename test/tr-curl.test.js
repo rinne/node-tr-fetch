@@ -421,7 +421,7 @@ test('--tr-fetch-ocsp-cache-size and --tr-fetch-ocsp-cache-ttl set the OCSP cach
         assert.equal(result.code, 0, args.join(' '));
         return [ Number(result.stderr.match(/"ocspCacheSize":(-?\d+)/)[1]), Number(result.stderr.match(/"ocspCacheTTL":(-?\d+)/)[1]) ];
     };
-    assert.deepEqual(await settings([]), [ 1024, 1800 ]);
+    assert.deepEqual(await settings([]), [ 1024, 86400 ]);
     assert.deepEqual(await settings([ '--tr-fetch-ocsp-cache-size', '8', '--tr-fetch-ocsp-cache-ttl', '60' ]), [ 8, 60 ]);
     assert.deepEqual(await settings([ '--tr-fetch-ocsp-cache-size', '0', '--tr-fetch-ocsp-cache-ttl=-1' ]), [ 0, -1 ]);
     // Merged into the OCSP policy, over the same settings in --tr-fetch-options.

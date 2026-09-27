@@ -29,10 +29,10 @@ const response = await trFetch(url, {
 	trFetchCrlPolicy: {
 		disabled: false,
 		maxCrlBytes: 16777216,
-		crlCacheScope: 'crl',
+		crlCacheScope: 'certificate',
 		crlCacheSize: 32,
 		crlCertificateCacheSize: 1024,
-		crlCacheTTL: 1800,
+		crlCacheTTL: 86400,
 		crlCheckDepth: 0,
 		missingCrlDistributionPoint: 'ignore',
 		unreachableCrlDistributionPoint: 'reject',
@@ -42,7 +42,7 @@ const response = await trFetch(url, {
 	trFetchOcspPolicy: {
 		disabled: false,
 		ocspCacheSize: 1024,
-		ocspCacheTTL: 1800,
+		ocspCacheTTL: 86400,
 		ocspCheckDepth: 0,
 		missingOcspUri: 'ignore',
 		unreachableOcspUri: 'reject',
@@ -94,29 +94,30 @@ A larger download is an unreachable distribution point; larger
 above the caller's limit is not used, even if an earlier caller with a higher
 limit cached it.
 
-With `crlCacheScope: 'crl'`, the CRL is downloaded into a single buffer,
-verified and scanned in place, and only its serial numbers are kept. Peak
-memory while fetching a CRL is roughly three to four times its size, most of
-it in Node's HTTP stream buffering, and is released afterwards. With
-`'certificate'`, the CRL is never held in memory and the limit bounds only the
-download; see [CRL cache scope](#crl-cache-scope).
+With the default `crlCacheScope: 'certificate'`, the CRL is never held in
+memory and the limit bounds only the download. With `'crl'`, the CRL is
+downloaded into a single buffer, verified and scanned in place, and only its
+serial numbers are kept; peak memory while fetching a CRL is then roughly
+three to four times its size, most of it in Node's HTTP stream buffering, and
+is released afterwards. See [CRL cache scope](#crl-cache-scope).
 
 ### CRL cache scope
 
 `trFetchCrlPolicy.crlCacheScope` selects how CRLs are processed and what the
-cache keeps. Only `'crl'` (the default) and `'certificate'` are accepted.
+cache keeps. Only `'certificate'` (the default) and `'crl'` are accepted.
 
-| | `'crl'` | `'certificate'` |
+| | `'certificate'` (default) | `'crl'` |
 |---|---|---|
-| Processing | Downloaded, then authenticated and indexed | Checked while streaming; never held |
-| Cached | Every revoked serial of the CRL | Whether the CRL lists each checked certificate |
-| Another certificate of the same CRL | Answered from the cache | Downloads the CRL again, unless cached as a candidate (see below) |
-| Peak memory for a 43 MB CRL | about 135–165 MB | about 40–47 MB |
-| Cached memory for that CRL | 14 MB | tens of bytes per certificate |
+| Processing | Checked while streaming; never held | Downloaded, then authenticated and indexed |
+| Cached | Whether the CRL lists each checked certificate | Every revoked serial of the CRL |
+| Another certificate of the same CRL | Downloads the CRL again, unless cached as a candidate (see below) | Answered from the cache |
+| Peak memory for a 43 MB CRL | about 40–47 MB | about 135–165 MB |
+| Cached memory for that CRL | tens of bytes per certificate | 14 MB |
 
-`'crl'` suits clients that talk to many servers whose certificates share a
-CRL. `'certificate'` suits clients that talk to few servers, or that meet very
-large CRLs.
+`'certificate'` suits most clients: command line tools, and servers that call
+a moderate number of API servers, particularly if they meet large CRLs. `'crl'`
+suits clients that talk to many different servers whose certificates share a
+CRL, such as proxies, where one cached CRL answers for all of them.
 
 In `'certificate'` scope, the CRL signature is computed as the CRL arrives,
 and every revoked entry is checked as with `'crl'`. Nothing is decided until
@@ -333,9 +334,11 @@ The cache settings are in `trFetchCrlPolicy`:
   CRLs. `crlCertificateCacheSize` limits the per-certificate results of scope
   `'certificate'`, and defaults to `1024` certificates. Any integer **0 or
   less** disables that cache for the call; `null` means the default.
-- `crlCacheTTL` defaults to `1800` **seconds** and applies to both. `0`
-  disables caching; `-1` removes the TTL limit. Other values must be
-  nonnegative safe integers.
+- `crlCacheTTL` defaults to `86400` **seconds** (a day) and applies to both.
+  It is a maximum: CRLs carry their own validity, and an entry expires at the
+  CRL's `nextUpdate` if that is sooner. Set a shorter TTL to recheck more
+  often. `0` disables caching; `-1` removes the TTL limit. Other values must
+  be nonnegative safe integers.
 - Entries expire at the earlier of their original TTL deadline and CRL
   `nextUpdate`. Reading an entry does not extend its lifetime.
 - A later caller's shorter TTL also limits the age of an existing entry.
@@ -550,9 +553,10 @@ request.
 
 - `trFetchOcspPolicy.ocspCacheSize` defaults to `1024` results. Any integer
   **0 or less** disables the cache for that call; `null` means the default.
-- `trFetchOcspPolicy.ocspCacheTTL` defaults to `1800` **seconds**. It is a
-  maximum: a response whose `nextUpdate` is sooner expires then. `0` disables
-  caching; `-1` leaves only `nextUpdate`.
+- `trFetchOcspPolicy.ocspCacheTTL` defaults to `86400` **seconds** (a day).
+  It is a maximum: a response whose `nextUpdate` is sooner expires then. Set
+  a shorter TTL to query responders more often. `0` disables caching; `-1`
+  leaves only `nextUpdate`.
 - As with CRLs, a later caller's shorter TTL also applies to existing entries,
   and reducing the size evicts the least recently used entries.
 
@@ -613,7 +617,7 @@ The `--tr-fetch-*` options set trFetch options directly:
 | Option | trFetch option |
 |---|---|
 | `--tr-fetch-max-crl-bytes <bytes>` | `trFetchCrlPolicy.maxCrlBytes`, a positive integer |
-| `--tr-fetch-crl-cache-scope <crl\|certificate>` | `trFetchCrlPolicy.crlCacheScope`; tr-curl's default is `certificate` |
+| `--tr-fetch-crl-cache-scope <crl\|certificate>` | `trFetchCrlPolicy.crlCacheScope` |
 | `--tr-fetch-crl-certificate-cache-size <count>` | `trFetchCrlPolicy.crlCertificateCacheSize`, an integer |
 | `--tr-fetch-crl-url <url>` | `trFetchCrlDistributionPointOverride` |
 | `--tr-fetch-ocsp-cache-size <count>` | `trFetchOcspPolicy.ocspCacheSize`, an integer |

@@ -80,11 +80,11 @@ test('defaults, partial policy and stripping without mutating caller options', f
     const options = splitOptions(input);
     assert.deepEqual(options.fetchOptions, { method: 'POST' });
     assert.deepEqual(options.policy, {
-        disabled: false, maxCrlBytes: 16777216, crlCacheScope: 'crl', crlCacheSize: 32, crlCertificateCacheSize: 1024,
+        disabled: false, maxCrlBytes: 16777216, crlCacheScope: 'certificate', crlCacheSize: 32, crlCertificateCacheSize: 1024,
         crlCacheTTL: -1, crlCheckDepth: 0,
         missingCrlDistributionPoint: 'ignore', unreachableCrlDistributionPoint: 'reject', invalidCrl: 'warn', revokedCertificate: 'reject'
     });
-    assert.equal(splitOptions().policy.crlCacheTTL, 1800);
+    assert.equal(splitOptions().policy.crlCacheTTL, 86400);
     assert.equal(splitOptions().policy.crlCheckDepth, 0);
     assert.deepEqual(Object.keys(splitOptions()).sort(), [ 'crl', 'debugEnabled', 'distributionPoint', 'fetchOptions', 'ocspPolicy',
         'ocspUri', 'policy', 'revocationPolicy', 'warningCb' ]);
@@ -105,7 +105,7 @@ test('cache sizes, TTL and check depths are policy settings; the former top-leve
     for (const value of [ -1, 0, 1, 86400 ]) {
         assert.equal(splitOptions({ trFetchCrlPolicy: { crlCacheTTL: value } }).policy.crlCacheTTL, value);
     }
-    assert.equal(splitOptions({ trFetchCrlPolicy: { crlCacheTTL: null } }).policy.crlCacheTTL, 1800);
+    assert.equal(splitOptions({ trFetchCrlPolicy: { crlCacheTTL: null } }).policy.crlCacheTTL, 86400);
     for (const value of [ -2, 1.5, Infinity, '1800', true ]) {
         assert.throws(() => splitOptions({ trFetchCrlPolicy: { crlCacheTTL: value } }), /crlCacheTTL must be -1 or a nonnegative safe integer/);
     }
@@ -207,7 +207,7 @@ test('CRL URLs accept only HTTP(S), never files, LDAP or URL credentials', funct
 
 test('OCSP defaults, depth, override and disabled policy options are validated and stripped', function() {
     assert.deepEqual(splitOptions().ocspPolicy, {
-        disabled: false, ocspCacheSize: 1024, ocspCacheTTL: 1800, ocspCheckDepth: 0,
+        disabled: false, ocspCacheSize: 1024, ocspCacheTTL: 86400, ocspCheckDepth: 0,
         missingOcspUri: 'ignore', unreachableOcspUri: 'reject', rejectedCertificate: 'reject'
     });
     for (const [depth, expected] of [ [ undefined, 0 ], [ 0, 0 ], [ 'leaf', 0 ], [ 2, 2 ], [ 'full-chain', Infinity ] ]) {
@@ -271,7 +271,7 @@ test('every module the package loads is listed in package.json files', function(
 });
 
 test('crlCacheScope accepts crl or certificate, only in the CRL policy', function() {
-    assert.equal(splitOptions().policy.crlCacheScope, 'crl');
+    assert.equal(splitOptions().policy.crlCacheScope, 'certificate');
     for (const value of [ 'crl', 'certificate' ]) {
         assert.equal(splitOptions({ trFetchCrlPolicy: { crlCacheScope: value } }).policy.crlCacheScope, value);
     }
@@ -426,7 +426,7 @@ test('applyPolicy delivers warnings to the callback instead of process warnings'
 
 test('OCSP cache size and TTL are OCSP policy settings with CRL-like validation', function() {
     assert.equal(splitOptions().ocspPolicy.ocspCacheSize, 1024);
-    assert.equal(splitOptions().ocspPolicy.ocspCacheTTL, 1800);
+    assert.equal(splitOptions().ocspPolicy.ocspCacheTTL, 86400);
     for (const value of [ -1, 0, 1, 5000 ]) {
         assert.equal(splitOptions({ trFetchOcspPolicy: { ocspCacheSize: value } }).ocspPolicy.ocspCacheSize, value);
     }
