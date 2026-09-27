@@ -460,7 +460,7 @@ test('the expiring cache reports its own label, and CRL cache events are unchang
 });
 
 test('trFetchCertificateRevocationPolicy: strategy and noRevocationStatus', function() {
-    assert.deepEqual(splitOptions().revocationPolicy, { strategy: 'both', noRevocationStatus: 'ignore' });
+    assert.deepEqual(splitOptions().revocationPolicy, { strategy: 'ocsp-first', noRevocationStatus: 'ignore' });
     for (const strategy of [ 'both', 'ocsp-first', 'crl-first' ]) {
         assert.equal(splitOptions({ trFetchCertificateRevocationPolicy: { strategy } }).revocationPolicy.strategy, strategy);
     }

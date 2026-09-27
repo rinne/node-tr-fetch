@@ -49,15 +49,16 @@ const response = await trFetch(url, {
 		rejectedCertificate: 'reject'
 	},
 	trFetchCertificateRevocationPolicy: {
-		strategy: 'both',
+		strategy: 'ocsp-first',
 		noRevocationStatus: 'ignore'
 	}
 });
 ```
 
 These are the defaults. Policy objects may specify only the properties to
-change. Both checks are enabled by default and operate independently (see
-[Revocation strategy](#revocation-strategy) for alternatives). Each
+change. Both checks are enabled by default: OCSP is checked first, and the CRL
+only when OCSP does not establish a certificate's status (see
+[Revocation strategy](#revocation-strategy)). Each
 failure policy (in the table below) accepts `'ignore'`, `'warn'` or
 `'reject'`; the other policy settings are described in their own sections.
 
@@ -150,8 +151,8 @@ and `crlCertificateCacheSize` the second, and `crlCacheTTL` applies to both
 
 | Value | Behavior |
 |---|---|
-| `'both'` (default) | Every enabled check runs, CRL first, and each check's failures are handled by its own policy at once. |
-| `'ocsp-first'` | OCSP runs first. The CRL is checked only if OCSP did not establish the status. |
+| `'ocsp-first'` (default) | OCSP runs first. The CRL is checked only if OCSP did not establish the status. |
+| `'both'` | Every enabled check runs, CRL first, and each check's failures are handled by its own policy at once. |
 | `'crl-first'` | The CRL is checked first. OCSP runs only if the CRL did not establish the status. |
 
 A check **establishes the status** when it produces an authenticated answer:
@@ -264,8 +265,9 @@ explicitly trusted and self-signed. Chain traversal has a defensive limit of
 
 The same policies apply at every selected depth. Each intermediate uses its
 own distribution points or OCSP URIs. Overrides apply only to the server
-certificate. A successful check does not override a rejection from the other
-enabled check.
+certificate. A revocation found by either check is never overridden by the
+other; how their other failures combine depends on the
+[revocation strategy](#revocation-strategy).
 
 ### Overrides
 
@@ -627,6 +629,11 @@ later objects replace earlier keys. The options above take precedence over the
 same settings in it, whatever their order, and the policy options are merged
 into its `trFetchCrlPolicy`, `trFetchOcspPolicy` and
 `trFetchCertificateRevocationPolicy` rather than replacing them.
+
+`--crlfile` and `--tr-fetch-crl-url` take effect when the CRL check runs. With
+the default strategy, `ocsp-first`, that is only when OCSP does not establish
+the status; use `--tr-fetch-revocation-strategy both` or `crl-first` to check
+the given CRL in any case.
 
 `--insecure` cannot be implemented through trFetch, which never relaxes TLS
 verification. With `-k`, tr-curl uses plain fetch with an unverified TLS

@@ -27,7 +27,7 @@ const DEFAULT_OCSP_POLICY = {
 };
 
 const DEFAULT_REVOCATION_POLICY = {
-    strategy: 'both',
+    strategy: 'ocsp-first',
     noRevocationStatus: 'ignore'
 };
 

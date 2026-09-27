@@ -80,6 +80,11 @@ function crlError(code, message) {
     };
 }
 
+// These tests exercise the CRL and OCSP checks together, on servers whose
+// OCSP responders answer: under the default strategy, 'ocsp-first', the CRL
+// check would not run.
+const bothChecks = { trFetchCertificateRevocationPolicy: { strategy: 'both' } };
+
 function captureDebug(t) {
     const events = [];
     const write = process.stderr.write.bind(process.stderr);
@@ -100,10 +105,10 @@ test('debug traces CRL/OCSP discovery, authenticated results and cache use witho
     });
     const events = captureDebug(t);
     for (const trFetchDebug of [ undefined, false ]) {
-        await (await trFetch(server.url, { trFetchDebug, trFetchCrlPolicy: { crlCacheTTL: 0 }, trFetchOcspPolicy: { ocspCacheTTL: 0 } })).text();
+        await (await trFetch(server.url, { ...bothChecks, trFetchDebug, trFetchCrlPolicy: { crlCacheTTL: 0 }, trFetchOcspPolicy: { ocspCacheTTL: 0 } })).text();
     }
     assert.equal(events.length, 0);
-    await (await trFetch(server.url + '/?token=application-secret', {
+    await (await trFetch(server.url + '/?token=application-secret', { ...bothChecks,
         trFetchDebug: true, method: 'POST', body: 'body-secret', headers: { authorization: 'Bearer header-secret' }
     })).text();
     for (const event of [ 'CRL distribution point detected in certificate', 'CRL cache miss', 'CRL fetched', 'CRL parsed',
@@ -128,7 +133,7 @@ test('debug traces CRL/OCSP discovery, authenticated results and cache use witho
     assert.ok(events.every(x => x.id === firstId));
     assert.doesNotMatch(JSON.stringify(events), /crl-secret|ocsp-secret|application-secret|body-secret|header-secret/);
     events.length = 0;
-    await (await trFetch(server.url, { trFetchDebug: true })).text();
+    await (await trFetch(server.url, { ...bothChecks, trFetchDebug: true })).text();
     assert.notEqual(events[0].id, firstId);
     assert.ok(events.some(x => x.event === 'CRL cache hit'));
     assert.ok(! events.some(x => x.event === 'CRL fetched'));
@@ -144,14 +149,14 @@ test('debug shows CRL and OCSP rejection and warning/ignore policies without cha
     const events = captureDebug(t);
     const warnings = [];
     t.mock.method(process, 'emitWarning', warning => warnings.push(warning));
-    await assert.rejects(trFetch(server.url, { trFetchDebug: true, trFetchCrlOverride: revokedCrl.der }), {
+    await assert.rejects(trFetch(server.url, { ...bothChecks, trFetchDebug: true, trFetchCrlOverride: revokedCrl.der }), {
         code: 'TR_FETCH_CERTIFICATE_REVOKED'
     });
     assert.equal(server.hits(), 0);
     assert.ok(events.some(x => x.event === 'CRL serial lookup completed' && x.result === 'revoked' && x.action === 'reject'));
     assert.ok(events.some(x => x.event === 'CRL policy applied' && x.action === 'reject'));
     events.length = 0;
-    await assert.rejects(trFetch(server.url, { trFetchDebug: true, trFetchOcspUriOverride: crlBase + '/debug-ocsp-revoked' }), {
+    await assert.rejects(trFetch(server.url, { ...bothChecks, trFetchDebug: true, trFetchOcspUriOverride: crlBase + '/debug-ocsp-revoked' }), {
         code: 'TR_FETCH_OCSP_CERTIFICATE_REJECTED'
     });
     assert.equal(server.hits(), 0);
@@ -159,7 +164,7 @@ test('debug shows CRL and OCSP rejection and warning/ignore policies without cha
     assert.ok(events.some(x => x.event === 'OCSP check completed' && x.result === 'revoked' && x.action === 'reject'));
     assert.ok(events.some(x => x.event === 'OCSP policy applied' && x.action === 'reject'));
     events.length = 0;
-    await (await trFetch(server.url, {
+    await (await trFetch(server.url, { ...bothChecks,
         trFetchDebug: true, trFetchCrlOverride: revokedCrl.der, trFetchCrlPolicy: { revokedCertificate: 'warn' },
         trFetchOcspUriOverride: crlBase + '/debug-ocsp-revoked', trFetchOcspPolicy: { rejectedCertificate: 'ignore' }
     })).text();
@@ -178,7 +183,7 @@ test('debug identifies intermediate depth and excludes the trust anchor', async 
     const server = await endpoint(t, { issuer: intermediate, chain: intermediate.pem,
                                        urls: [ crlBase + '/debug-chain-leaf-crl' ], ocspUrls: [ crlBase + '/debug-chain-leaf-ocsp' ] });
     const events = captureDebug(t);
-    await (await trFetch(server.url, { trFetchDebug: true, trFetchCrlPolicy: { crlCheckDepth: 'full-chain' }, trFetchOcspPolicy: { ocspCheckDepth: 'full-chain' } })).text();
+    await (await trFetch(server.url, { ...bothChecks, trFetchDebug: true, trFetchCrlPolicy: { crlCheckDepth: 'full-chain' }, trFetchOcspPolicy: { ocspCheckDepth: 'full-chain' } })).text();
     for (const event of [ 'CRL distribution point detected in certificate', 'CRL serial lookup completed',
                           'OCSP URI detected in certificate', 'OCSP check completed' ]) {
         const found = events.filter(x => x.event === event);
@@ -247,7 +252,7 @@ test('trFetchWarningCb receives CRL and OCSP warnings instead of process warning
     const delivered = [];
     // Context, like the request, comes with the callback as a closure.
     const request = 'first';
-    assert.equal(await (await trFetch(server.url, { ...options, trFetchWarningCb: warning => delivered.push([ request, warning ]) })).text(), 'ok');
+    assert.equal(await (await trFetch(server.url, { ...bothChecks, ...options, trFetchWarningCb: warning => delivered.push([ request, warning ]) })).text(), 'ok');
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(emitted.length, 0);
     assert.deepEqual(delivered.map(([context, warning]) => [ context, warning.name, warning.code ]), [
@@ -263,16 +268,16 @@ test('trFetchWarningCb receives CRL and OCSP warnings instead of process warning
     }, async () => {
         throw new Error('callback rejected');
     }, () => new Promise(() => {}) ]) {
-        assert.equal(await (await trFetch(server.url, { ...options, trFetchWarningCb })).text(), 'ok');
+        assert.equal(await (await trFetch(server.url, { ...bothChecks, ...options, trFetchWarningCb })).text(), 'ok');
     }
     await new Promise(resolve => setImmediate(resolve));
     assert.deepEqual(reported.map(x => x.message), [ 'callback threw', 'callback threw', 'callback rejected', 'callback rejected' ]);
     assert.equal(emitted.length, 0);
     // Rejections are unaffected by the callback.
-    await assert.rejects(trFetch(server.url, { trFetchWarningCb: () => {}, trFetchCrlPolicy: { missingCrlDistributionPoint: 'reject' } }),
+    await assert.rejects(trFetch(server.url, { ...bothChecks, trFetchWarningCb: () => {}, trFetchCrlPolicy: { missingCrlDistributionPoint: 'reject' } }),
         { code: 'TR_FETCH_CRL_MISSING_DISTRIBUTION_POINT' });
     // Without a callback, warnings are process warnings as before.
-    await (await trFetch(server.url, options)).text();
+    await (await trFetch(server.url, { ...bothChecks, ...options })).text();
     assert.equal(emitted.length, 2);
 });
 
@@ -799,8 +804,10 @@ test('strategy ocsp-first: OCSP answers alone; without an answer the CRL decides
     assert.equal(count('/st-crl-revoked'), 0);
     assert.ok(events.some(x => (x.event === 'CRL check skipped') && (x.reason === 'status established by OCSP')));
     t.mock.restoreAll();
-    // The same certificate under the default strategy is revoked by its CRL.
-    await assert.rejects(trFetch(good.url, { trFetchOcspPolicy: { ocspCacheTTL: 0 } }), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
+    // The same certificate with both checks is revoked by its CRL.
+    await assert.rejects(trFetch(good.url, { ...bothChecks, trFetchOcspPolicy: { ocspCacheTTL: 0 } }), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
+    // And ocsp-first is the default.
+    assert.equal(await (await trFetch(good.url, { trFetchOcspPolicy: { ocspCacheTTL: 0 } })).text(), 'ok');
     // OCSP revoked is authoritative.
     routes.set('/st-ocsp-revoked', ocspRoute(ca, { status: 'revoked' }));
     const revoked = await endpoint(t, { urls: [ crlBase + '/st-crl-good' ], ocspUrls: [ crlBase + '/st-ocsp-revoked' ] });
@@ -846,8 +853,8 @@ test('strategy crl-first: the CRL answers alone; without an answer OCSP decides'
     assert.equal(count('/cf-ocsp-good'), 1);
     const revoked = await endpoint(t, { ocspUrls: [ crlBase + '/cf-ocsp-revoked' ] });
     await assert.rejects(trFetch(revoked.url, first), { code: 'TR_FETCH_OCSP_CERTIFICATE_REJECTED' });
-    // The default strategy checks both and applies each failure at once.
-    await assert.rejects(trFetch(noCrl.url, { trFetchCrlPolicy: { missingCrlDistributionPoint: 'reject' } }),
+    // With both checks, each failure applies at once.
+    await assert.rejects(trFetch(noCrl.url, { ...bothChecks, trFetchCrlPolicy: { missingCrlDistributionPoint: 'reject' } }),
                          { code: 'TR_FETCH_CRL_MISSING_DISTRIBUTION_POINT' });
 });
 

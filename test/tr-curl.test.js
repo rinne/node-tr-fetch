@@ -302,7 +302,12 @@ test('HTTPS uses trFetch CRL and OCSP checks, with --cacert trust', async functi
     result = await curl([ '-sS', secureUrl ]);
     assert.equal(result.code, 60);
     assert.match(result.stderr, /SSL certificate problem/);
+    // By default OCSP answers first (exit 91); with both checks, the CRL
+    // check comes first and reports the revocation (exit 60).
     result = await curl([ '-sS', '--cacert', caFile, revokedUrl ]);
+    assert.equal(result.code, 91);
+    assert.match(result.stderr, /OCSP rejected certificate: responder reports revoked/);
+    result = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-revocation-strategy', 'both', revokedUrl ]);
     assert.equal(result.code, 60);
     assert.match(result.stderr, /Revoked server certificate/);
     result = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-options', '{"trFetchCrlPolicy":{"disabled":true}}', revokedUrl ]);
@@ -313,7 +318,11 @@ test('HTTPS uses trFetch CRL and OCSP checks, with --cacert trust', async functi
     assert.equal(result.code, 0);
     const crlFile = path.join(tmp, 'revoked.crl');
     fs.writeFileSync(crlFile, (await fixtures.crl(ca, { serials: [ 42 ] })).pem);
+    // An explicit CRL is used when the CRL check runs: not when OCSP has
+    // already answered under the default strategy.
     result = await curl([ '-sS', '--cacert', caFile, '--crlfile', crlFile, secureUrl ]);
+    assert.equal(result.code, 0);
+    result = await curl([ '-sS', '--cacert', caFile, '--crlfile', crlFile, '--tr-fetch-revocation-strategy', 'crl-first', secureUrl ]);
     assert.equal(result.code, 60);
     assert.equal((await curl([ '-sS', '--cacert', path.join(tmp, 'none.pem'), secureUrl ])).code, 77);
     assert.equal((await curl([ '-sS', '--cacert', caFile, '--crlfile', path.join(tmp, 'none.crl'), secureUrl ])).code, 82);
@@ -325,24 +334,26 @@ test('--tr-fetch-* options set the CRL size limit and CRL/OCSP locations, overri
     for (const name of [ 'max-crl-bytes <bytes>', 'crl-url <url>', 'ocsp-url <url>', 'options <json>' ]) {
         assert.match(help, new RegExp(`--tr-fetch-${name}`));
     }
-    let result = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-max-crl-bytes', '10', secureUrl ]);
+    // Both checks run, so the CRL check is exercised where OCSP answers.
+    const both = [ '--tr-fetch-revocation-strategy', 'both' ];
+    let result = await curl([ '-sS', '--cacert', caFile, ...both, '--tr-fetch-max-crl-bytes', '10', secureUrl ]);
     assert.equal(result.code, 60);
     assert.match(result.stderr, /CRL download exceeds maxCrlBytes \(10 bytes\)/);
-    result = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-options', '{"trFetchCrlPolicy":{"maxCrlBytes":10}}',
+    result = await curl([ '-sS', '--cacert', caFile, ...both, '--tr-fetch-options', '{"trFetchCrlPolicy":{"maxCrlBytes":10}}',
         '--tr-fetch-max-crl-bytes=100000', secureUrl ]);
     assert.equal(result.code, 0);
     // The size limit merges into the policy instead of replacing it: the
     // revoked CRL result is ignored, so OCSP reports the revocation.
-    result = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-max-crl-bytes', '100000',
+    result = await curl([ '-sS', '--cacert', caFile, ...both, '--tr-fetch-max-crl-bytes', '100000',
         '--tr-fetch-options', '{"trFetchCrlPolicy":{"revokedCertificate":"ignore"}}', revokedUrl ]);
     assert.equal(result.code, 91);
     for (const value of [ '0', '-1', '1.5', '1k', '', '99999999999999999' ]) {
         assert.equal((await curl([ '-s', '--tr-fetch-max-crl-bytes', value, secureUrl ])).code, 2, value);
     }
-    result = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-crl-url', `${base}/crl-42`, secureUrl ]);
+    result = await curl([ '-sS', '--cacert', caFile, ...both, '--tr-fetch-crl-url', `${base}/crl-42`, secureUrl ]);
     assert.equal(result.code, 60);
     assert.match(result.stderr, /Revoked server certificate/);
-    result = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-options', `{"trFetchCrlDistributionPointOverride":"${base}/crl-42"}`,
+    result = await curl([ '-sS', '--cacert', caFile, ...both, '--tr-fetch-options', `{"trFetchCrlDistributionPointOverride":"${base}/crl-42"}`,
         '--tr-fetch-crl-url', `${base}/crl`, secureUrl ]);
     assert.equal(result.code, 0);
     result = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-ocsp-url', `${base}/ocsp-revoked`, secureUrl ]);
@@ -356,7 +367,8 @@ test('--tr-fetch-* options set the CRL size limit and CRL/OCSP locations, overri
 test('--tr-fetch-crl-cache-scope selects the CRL cache scope; tr-curl defaults to certificate', async function() {
     assert.match((await curl([ '--help' ])).stdout, /--tr-fetch-crl-cache-scope <crl\|certificate>/);
     const scope = async args => {
-        const result = await curl([ '-s', '-v', '--cacert', caFile, '-o', path.join(tmp, 'scope'), ...args, secureUrl ]);
+        const result = await curl([ '-s', '-v', '--cacert', caFile, '-o', path.join(tmp, 'scope'), '--tr-fetch-revocation-strategy', 'both',
+            ...args, secureUrl ]);
         assert.equal(result.code, 0, args.join(' '));
         return [ result.stderr.match(/"crlCacheScope":"(\w+)"/)[1],
             /CRL authenticated while streaming/.test(result.stderr) ? 'streamed' : 'indexed' ];
@@ -367,11 +379,13 @@ test('--tr-fetch-crl-cache-scope selects the CRL cache scope; tr-curl defaults t
     assert.deepEqual(await scope([ '--tr-fetch-crl-cache-scope=certificate', '--tr-fetch-options', '{"trFetchCrlPolicy":{"crlCacheScope":"crl"}}' ]),
         [ 'certificate', 'streamed' ]);
     // The size limit and the scope merge into one policy.
-    const merged = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-crl-cache-scope', 'crl', '--tr-fetch-max-crl-bytes', '10', secureUrl ]);
+    const merged = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-revocation-strategy', 'both', '--tr-fetch-crl-cache-scope', 'crl',
+        '--tr-fetch-max-crl-bytes', '10', secureUrl ]);
     assert.equal(merged.code, 60);
     assert.match(merged.stderr, /exceeds maxCrlBytes \(10 bytes\)/);
     for (const scope of [ 'certificate', 'crl' ]) {
-        const revoked = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-crl-cache-scope', scope, revokedUrl ]);
+        const revoked = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-revocation-strategy', 'both', '--tr-fetch-crl-cache-scope', scope,
+            revokedUrl ]);
         assert.equal(revoked.code, 60, scope);
         assert.match(revoked.stderr, /Revoked server certificate/, scope);
     }
@@ -432,7 +446,8 @@ test('--tr-fetch-revocation-strategy and --tr-fetch-no-revocation-status set the
         return [ result.stderr.match(/"strategy":"([a-z-]+)"/)[1], result.stderr.match(/"noRevocationStatus":"([a-z]+)"/)[1],
             /CRL check skipped.*status established by OCSP/.test(result.stderr) ];
     };
-    assert.deepEqual(await settings([]), [ 'both', 'ignore', false ]);
+    assert.deepEqual(await settings([]), [ 'ocsp-first', 'ignore', true ]);
+    assert.deepEqual(await settings([ '--tr-fetch-revocation-strategy', 'both' ]), [ 'both', 'ignore', false ]);
     assert.deepEqual(await settings([ '--tr-fetch-revocation-strategy', 'ocsp-first', '--tr-fetch-no-revocation-status', 'reject' ]),
                      [ 'ocsp-first', 'reject', true ]);
     assert.deepEqual(await settings([ '--tr-fetch-options', '{"trFetchCertificateRevocationPolicy":{"strategy":"crl-first"}}',
@@ -480,7 +495,7 @@ test('TLS version and cipher options', async function() {
 });
 
 test('--verbose shows request, response and trFetch debug output', async function() {
-    const result = await curl([ '-s', '-v', '-u', 'joe:pw', '--cacert', caFile, secureUrl ]);
+    const result = await curl([ '-s', '-v', '-u', 'joe:pw', '--cacert', caFile, '--tr-fetch-revocation-strategy', 'both', secureUrl ]);
     assert.equal(result.code, 0);
     assert.match(result.stderr, /^> GET \/ HTTP\/1\.1$/m);
     assert.match(result.stderr, /^> Authorization: Basic /m);

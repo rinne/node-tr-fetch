@@ -117,7 +117,7 @@ function optionDefinitions() {
             value => [ 'crl', 'certificate' ].includes(value) ? value : undefined),
         arg(undefined, 'tr-fetch-crl-certificate-cache-size', '<count> Cached per-certificate CRL results (default 1024; 0 disables)',
             integerCb),
-        arg(undefined, 'tr-fetch-revocation-strategy', '<both|ocsp-first|crl-first> Which revocation checks to run (default both)',
+        arg(undefined, 'tr-fetch-revocation-strategy', '<both|ocsp-first|crl-first> Which revocation checks to run (default ocsp-first)',
             value => [ 'both', 'ocsp-first', 'crl-first' ].includes(value) ? value : undefined),
         arg(undefined, 'tr-fetch-no-revocation-status', '<ignore|warn|reject> When no check establishes a status (default ignore)',
             value => [ 'ignore', 'warn', 'reject' ].includes(value) ? value : undefined),
