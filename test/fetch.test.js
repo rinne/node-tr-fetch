@@ -100,7 +100,7 @@ test('debug traces CRL/OCSP discovery, authenticated results and cache use witho
     });
     const events = captureDebug(t);
     for (const trFetchDebug of [ undefined, false ]) {
-        await (await trFetch(server.url, { trFetchDebug, trFetchCrlCacheTTL: 0 })).text();
+        await (await trFetch(server.url, { trFetchDebug, trFetchCrlPolicy: { crlCacheTTL: 0 } })).text();
     }
     assert.equal(events.length, 0);
     await (await trFetch(server.url + '/?token=application-secret', {
@@ -176,7 +176,7 @@ test('debug identifies intermediate depth and excludes the trust anchor', async 
     const server = await endpoint(t, { issuer: intermediate, chain: intermediate.pem,
                                        urls: [ crlBase + '/debug-chain-leaf-crl' ], ocspUrls: [ crlBase + '/debug-chain-leaf-ocsp' ] });
     const events = captureDebug(t);
-    await (await trFetch(server.url, { trFetchDebug: true, trFetchCrlCheckDepth: 'full-chain', trFetchOcspCheckDepth: 'full-chain' })).text();
+    await (await trFetch(server.url, { trFetchDebug: true, trFetchCrlPolicy: { crlCheckDepth: 'full-chain' }, trFetchOcspPolicy: { ocspCheckDepth: 'full-chain' } })).text();
     for (const event of [ 'CRL distribution point detected in certificate', 'CRL serial lookup completed',
                           'OCSP URI detected in certificate', 'OCSP check completed' ]) {
         const found = events.filter(x => x.event === event);
@@ -416,11 +416,49 @@ test('certificate scope: one download refreshes all cached certificates of the s
     // download, which revokes b, b is answered without a download of its own.
     await new Promise(resolve => setTimeout(resolve, 1100));
     routes.set('/cs-refresh', (await fixtures.crl(ca, { serials: [ 51, 52 ], start: Date.now() })).der);
-    await (await trFetch(c.url, byCertificate({ trFetchCrlCacheTTL: 1 }))).text();
+    await (await trFetch(c.url, byCertificate({ trFetchCrlPolicy: { crlCacheTTL: 1 } }))).text();
     assert.equal(count(), 3);
-    await assert.rejects(trFetch(b.url, byCertificate({ trFetchCrlCacheTTL: 1 })), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
-    await assert.rejects(trFetch(a.url, byCertificate({ trFetchCrlCacheTTL: 1 })), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
+    await assert.rejects(trFetch(b.url, byCertificate({ trFetchCrlPolicy: { crlCacheTTL: 1 } })), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
+    await assert.rejects(trFetch(a.url, byCertificate({ trFetchCrlPolicy: { crlCacheTTL: 1 } })), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
     assert.equal(count(), 3);
+});
+
+test('crlCertificateCacheSize limits per-certificate results separately from crlCacheSize; crlCacheTTL applies to both', async function(t) {
+    routes.set('/cs-size', goodCrl.der);
+    const count = () => crlRequests.filter(x => x.url === '/cs-size').length;
+    const [a, b] = await Promise.all([ 71, 72 ].map(serial => endpoint(t, { urls: [ crlBase + '/cs-size' ], serial })));
+    // The whole-CRL cache disabled does not affect per-certificate results.
+    const options = byCertificate({ trFetchCrlPolicy: { crlCacheSize: 0 } });
+    await (await trFetch(a.url, options)).text();
+    await (await trFetch(a.url, options)).text();
+    assert.equal(count(), 1);
+    // One result slot: b evicts a, so a downloads again.
+    const one = byCertificate({ trFetchCrlPolicy: { crlCertificateCacheSize: 1 } });
+    await (await trFetch(b.url, one)).text();
+    assert.equal(count(), 2);
+    await (await trFetch(a.url, one)).text();
+    assert.equal(count(), 3);
+    // Disabled: every check downloads.
+    const none = byCertificate({ trFetchCrlPolicy: { crlCertificateCacheSize: 0 } });
+    await (await trFetch(a.url, none)).text();
+    await (await trFetch(a.url, none)).text();
+    assert.equal(count(), 5);
+    // crlCacheTTL applies to per-certificate results too, including a later
+    // caller's shorter TTL; 0 disables them.
+    await (await trFetch(b.url, byCertificate())).text();
+    assert.equal(count(), 6);
+    await (await trFetch(b.url, byCertificate({ trFetchCrlPolicy: { crlCacheTTL: 0 } }))).text();
+    assert.equal(count(), 7);
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    await (await trFetch(b.url, byCertificate())).text();
+    assert.equal(count(), 7);
+    await (await trFetch(b.url, byCertificate({ trFetchCrlPolicy: { crlCacheTTL: 1 } }))).text();
+    assert.equal(count(), 8);
+    // And the per-certificate size does not limit the whole-CRL cache.
+    const crlScope = { trFetchCrlPolicy: { crlCertificateCacheSize: 0 }, trFetchOcspPolicy: { disabled: true } };
+    await (await trFetch(a.url, crlScope)).text();
+    await (await trFetch(b.url, crlScope)).text();
+    assert.equal(count(), 9);
 });
 
 test('certificate scope: an older CRL never replaces a newer result, and a changed scope drops candidates', async function(t) {
@@ -458,7 +496,7 @@ test('CRL cache is shared, TTL zero and nonpositive sizes bypass it', async func
     await (await trFetch(server.url)).text();
     assert.equal(count(), 1);
     routes.set('/cache', revokedCrl.der);
-    for (const options of [ { trFetchCrlCacheTTL: 0 }, { trFetchCrlCacheSize: 0 }, { trFetchCrlCacheSize: -5 } ]) {
+    for (const options of [ { trFetchCrlPolicy: { crlCacheTTL: 0 } }, { trFetchCrlPolicy: { crlCacheSize: 0 } }, { trFetchCrlPolicy: { crlCacheSize: -5 } } ]) {
         await assert.rejects(trFetch(server.url, options), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
     }
     assert.equal(count(), 4);
@@ -524,16 +562,16 @@ test('leaf default and numeric/full-chain depth; overrides only replace leaf CRL
     const leafCrl = await fixtures.crl(intermediate);
     const server = await endpoint(t, { issuer: intermediate, chain: intermediate.pem });
     for (const depth of [ undefined, 0, 'leaf' ]) {
-        await (await trFetch(server.url, { trFetchCrlCheckDepth: depth, trFetchCrlOverride: leafCrl.der })).text();
+        await (await trFetch(server.url, { trFetchCrlPolicy: { crlCheckDepth: depth }, trFetchCrlOverride: leafCrl.der })).text();
     }
     for (const depth of [ 1, 2, 'full-chain' ]) {
-        await assert.rejects(trFetch(server.url, { trFetchCrlCheckDepth: depth, trFetchCrlOverride: leafCrl.der }), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
+        await assert.rejects(trFetch(server.url, { trFetchCrlPolicy: { crlCheckDepth: depth }, trFetchCrlOverride: leafCrl.der }), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
     }
 });
 
 test('full-chain excludes the trust anchor even with missing-DP reject', async function(t) {
     const server = await endpoint(t, { urls: [ crlBase + '/good' ] });
-    await (await trFetch(server.url, { trFetchCrlCheckDepth: 'full-chain', trFetchCrlPolicy: { missingCrlDistributionPoint: 'reject' } })).text();
+    await (await trFetch(server.url, { trFetchCrlPolicy: { crlCheckDepth: 'full-chain', missingCrlDistributionPoint: 'reject' } })).text();
 });
 
 test('custom global dispatcher is rejected rather than silently losing its checks', async function() {
@@ -590,7 +628,7 @@ test('CRL downloads that bypass the verifying dispatcher are unreachable', async
         const { dispatcher, ...rest } = init;
         return String(input instanceof Request ? input.url : input).startsWith(crlBase) ? original(input, rest) : original(input, init);
     }, async function() {
-        await assert.rejects(trFetch(server.url, { trFetchCrlCacheTTL: 0 }),
+        await assert.rejects(trFetch(server.url, { trFetchCrlPolicy: { crlCacheTTL: 0 } }),
             crlError('TR_FETCH_CRL_UNREACHABLE_DISTRIBUTION_POINT', /did not come through the verifying dispatcher/));
     });
     assert.equal(server.hits(), 0);
@@ -717,18 +755,18 @@ test('OCSP depth is independent of CRL depth and overrides apply only to the lea
     const server = await endpoint(t, { issuer: intermediate, chain: intermediate.pem });
     for (const depth of [ undefined, 0, 'leaf' ]) {
         await (await trFetch(server.url, {
-            trFetchCrlCheckDepth: 'full-chain', trFetchOcspCheckDepth: depth,
+            trFetchCrlPolicy: { crlCheckDepth: 'full-chain' }, trFetchOcspPolicy: { ocspCheckDepth: depth },
             trFetchOcspUriOverride: crlBase + '/ocsp-leaf'
         })).text();
     }
     for (const depth of [ 1, 2, 'full-chain' ]) {
-        await assert.rejects(trFetch(server.url, { trFetchCrlCheckDepth: 0,
-                                                   trFetchOcspCheckDepth: depth, trFetchOcspUriOverride: crlBase + '/ocsp-leaf'
+        await assert.rejects(trFetch(server.url, { trFetchCrlPolicy: { crlCheckDepth: 0 },
+                                                   trFetchOcspPolicy: { ocspCheckDepth: depth }, trFetchOcspUriOverride: crlBase + '/ocsp-leaf'
                                                  }), { code: 'TR_FETCH_OCSP_CERTIFICATE_REJECTED', serialNumber: '64' });
     }
     routes.set('/ocsp-intermediate', ocspRoute(ca));
-    await (await trFetch(server.url, { trFetchOcspCheckDepth: 'full-chain',
-                                       trFetchOcspUriOverride: crlBase + '/ocsp-leaf', trFetchOcspPolicy: { missingOcspUri: 'reject' }
+    await (await trFetch(server.url, { trFetchOcspUriOverride: crlBase + '/ocsp-leaf',
+                                       trFetchOcspPolicy: { ocspCheckDepth: 'full-chain', missingOcspUri: 'reject' }
                                      })).text();
 });
 

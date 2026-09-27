@@ -17,11 +17,14 @@ async function trFetch(input, options) {
     debug?.('Verification configured', {
         url: debugUrl(request.url),
         crl: config.policy.disabled ? 'disabled' : 'enabled',
-        crlDepth: (config.checkDepth === Infinity) ? 'full-chain' : config.checkDepth,
+        crlDepth: (config.policy.crlCheckDepth === Infinity) ? 'full-chain' : config.policy.crlCheckDepth,
         maxCrlBytes: config.policy.maxCrlBytes,
         crlCacheScope: config.policy.crlCacheScope,
+        crlCacheSize: config.policy.crlCacheSize,
+        crlCertificateCacheSize: config.policy.crlCertificateCacheSize,
+        crlCacheTTL: config.policy.crlCacheTTL,
         ocsp: config.ocspPolicy.disabled ? 'disabled' : 'enabled',
-        ocspDepth: (config.ocspCheckDepth === Infinity) ? 'full-chain' : config.ocspCheckDepth
+        ocspDepth: (config.ocspPolicy.ocspCheckDepth === Infinity) ? 'full-chain' : config.ocspPolicy.ocspCheckDepth
     });
     const check = (config.policy.disabled && config.ocspPolicy.disabled) ? undefined :
           (peer, hostname) => checkChain(peer, hostname, config, signal);

@@ -30,27 +30,29 @@ const response = await trFetch(url, {
 		disabled: false,
 		maxCrlBytes: 16777216,
 		crlCacheScope: 'crl',
+		crlCacheSize: 32,
+		crlCertificateCacheSize: 1024,
+		crlCacheTTL: 1800,
+		crlCheckDepth: 0,
 		missingCrlDistributionPoint: 'ignore',
 		unreachableCrlDistributionPoint: 'reject',
 		invalidCrl: 'reject',
 		revokedCertificate: 'reject'
 	},
-	trFetchCrlCacheSize: 32,
-	trFetchCrlCacheTTL: 1800,
-	trFetchCrlCheckDepth: 0,
 	trFetchOcspPolicy: {
 		disabled: false,
+		ocspCheckDepth: 0,
 		missingOcspUri: 'ignore',
 		unreachableOcspUri: 'reject',
 		rejectedCertificate: 'reject'
-	},
-	trFetchOcspCheckDepth: 0
+	}
 });
 ```
 
 These are the defaults. Policy objects may specify only the properties to
 change. Both checks are enabled by default and operate independently. Each
-failure policy accepts `'ignore'`, `'warn'` or `'reject'`.
+failure policy (in the table below) accepts `'ignore'`, `'warn'` or
+`'reject'`; the other policy settings are described in their own sections.
 
 | Policy | Condition |
 |---|---|
@@ -128,8 +130,9 @@ certificate and the distribution URL:
 - `trFetchCrlOverride` data is checked directly and never cached.
 
 A download failure or an invalid CRL leaves other entries unchanged. The CRL
-cache and this result cache are separate, and `trFetchCrlCacheSize` and
-`trFetchCrlCacheTTL` apply to each.
+cache and this result cache are separate: `crlCacheSize` limits the first
+and `crlCertificateCacheSize` the second, and `crlCacheTTL` applies to both
+(see [Cache](#cache)).
 
 ### Disabling a check
 
@@ -195,8 +198,8 @@ URL paths and certificate serial numbers remain visible.
 
 ### Check depth
 
-`trFetchCrlCheckDepth` and `trFetchOcspCheckDepth` are independent top-level
-options with the same values:
+`trFetchCrlPolicy.crlCheckDepth` and `trFetchOcspPolicy.ocspCheckDepth` are
+independent settings with the same values:
 
 | Value | Certificates checked |
 |---|---|
@@ -274,17 +277,24 @@ on every use: validity dates, scope and distribution point, the certificate's
 issuer name and signature, and the serial lookup. An entry serves only the
 issuer certificate that authenticated it.
 
-- `trFetchCrlCacheSize` defaults to `32` entries. Any integer **0 or less**
-  disables caching for that call.
-- `trFetchCrlCacheTTL` defaults to `1800` **seconds**. `0` disables caching;
-  `-1` removes the TTL limit. Other values must be nonnegative safe integers.
+The cache settings are in `trFetchCrlPolicy`:
+
+- `crlCacheSize` limits the CRL cache of scope `'crl'`, and defaults to `32`
+  CRLs. `crlCertificateCacheSize` limits the per-certificate results of scope
+  `'certificate'`, and defaults to `1024` certificates. Any integer **0 or
+  less** disables that cache for the call; `null` means the default.
+- `crlCacheTTL` defaults to `1800` **seconds** and applies to both. `0`
+  disables caching; `-1` removes the TTL limit. Other values must be
+  nonnegative safe integers.
 - Entries expire at the earlier of their original TTL deadline and CRL
   `nextUpdate`. Reading an entry does not extend its lifetime.
 - A later caller's shorter TTL also limits the age of an existing entry.
   A longer TTL cannot extend an entry's original expiry.
 - The calling request's size limit is applied whenever the shared cache is
   accessed or updated. Reducing the size evicts the least recently used entries.
-- Expired entries are removed lazily on cache access. They are never reused.
+- Expired entries are removed lazily on cache access and never reused. (In
+  the per-certificate cache they stay as refresh candidates, never as answers;
+  see [CRL cache scope](#crl-cache-scope).)
 
 With TTL `-1`, CRLs still expire at `nextUpdate` and can be evicted by LRU.
 Concurrent misses can download the same CRL independently; cancellation and
@@ -493,7 +503,7 @@ tr-curl --cacert private-ca.pem --crlfile current.crl https://internal.example/
 | Failure and limits | `-f/--fail`, `--fail-with-body`, `--fail-early`, `--max-filesize`, `-m/--max-time` |
 | Messages | `-v/--verbose`, `-s/--silent`, `-S/--show-error`, `--no-progress-meter`, `-#/--progress-bar`, `-h/--help`, `-V/--version` |
 | TLS | `-k/--insecure`, `--cacert`, `--crlfile`, `-1/--tlsv1`, `--tlsv1.0` … `--tlsv1.3`, `--tls-max`, `--ciphers`, `--tls13-ciphers` |
-| trFetch | `--tr-fetch-max-crl-bytes`, `--tr-fetch-crl-cache-scope`, `--tr-fetch-crl-url`, `--tr-fetch-ocsp-url`, `--tr-fetch-options` |
+| trFetch | `--tr-fetch-max-crl-bytes`, `--tr-fetch-crl-cache-scope`, `--tr-fetch-crl-certificate-cache-size`, `--tr-fetch-crl-url`, `--tr-fetch-ocsp-url`, `--tr-fetch-options` |
 
 `--verbose` prints the request and response headers, prefixed with `>` and
 `<` like curl, and also enables `trFetchDebug`, so the revocation diagnostics
@@ -506,16 +516,17 @@ The `--tr-fetch-*` options set trFetch options directly:
 |---|---|
 | `--tr-fetch-max-crl-bytes <bytes>` | `trFetchCrlPolicy.maxCrlBytes`, a positive integer |
 | `--tr-fetch-crl-cache-scope <crl\|certificate>` | `trFetchCrlPolicy.crlCacheScope`; tr-curl's default is `certificate` |
+| `--tr-fetch-crl-certificate-cache-size <count>` | `trFetchCrlPolicy.crlCertificateCacheSize`, an integer |
 | `--tr-fetch-crl-url <url>` | `trFetchCrlDistributionPointOverride` |
 | `--tr-fetch-ocsp-url <url>` | `trFetchOcspUriOverride` |
 | `--crlfile <file>` | `trFetchCrlOverride`, read from the file |
 
 `--tr-fetch-options` takes a JSON object of any trFetch options, for example
-`'{"trFetchCrlCheckDepth":"full-chain"}'`. It can be repeated; later objects
-replace earlier keys. The options above take precedence over the same settings
-in it, whatever their order, and `--tr-fetch-max-crl-bytes` and
-`--tr-fetch-crl-cache-scope` are merged into its `trFetchCrlPolicy` rather
-than replacing it.
+`'{"trFetchCrlPolicy":{"crlCheckDepth":"full-chain"}}'`. It can be repeated;
+later objects replace earlier keys. The options above take precedence over the
+same settings in it, whatever their order, and `--tr-fetch-max-crl-bytes`,
+`--tr-fetch-crl-cache-scope` and `--tr-fetch-crl-certificate-cache-size` are
+merged into its `trFetchCrlPolicy` rather than replacing it.
 
 `--insecure` cannot be implemented through trFetch, which never relaxes TLS
 verification. With `-k`, tr-curl uses plain fetch with an unverified TLS

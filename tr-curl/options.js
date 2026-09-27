@@ -30,6 +30,10 @@ function positiveBytesCb(value) {
     return (/^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value))) ? Number(value) : undefined;
 }
 
+function integerCb(value) {
+    return (/^-?(0|[1-9]\d*)$/.test(value) && Number.isSafeInteger(Number(value))) ? Number(value) : undefined;
+}
+
 function networkUrlCb(value) {
     return (URL.canParse(value) && [ 'http:', 'https:' ].includes(new URL(value).protocol)) ? value : undefined;
 }
@@ -107,6 +111,8 @@ function optionDefinitions() {
         arg(undefined, 'tr-fetch-max-crl-bytes', '<bytes> Largest CRL accepted (default 16777216)', positiveBytesCb),
         arg(undefined, 'tr-fetch-crl-cache-scope', '<crl|certificate> Cache whole CRLs or results per certificate (default certificate)',
             value => [ 'crl', 'certificate' ].includes(value) ? value : undefined),
+        arg(undefined, 'tr-fetch-crl-certificate-cache-size', '<count> Cached per-certificate CRL results (default 1024; 0 disables)',
+            integerCb),
         arg(undefined, 'tr-fetch-crl-url', '<url> Fetch the server certificate\'s CRL from this URL instead', networkUrlCb),
         arg(undefined, 'tr-fetch-ocsp-url', '<url> Query this OCSP responder for the server certificate instead', networkUrlCb),
         arg(undefined, 'tr-fetch-options', '<json> Extra trFetch options as a JSON object', jsonObjectCb, true),
@@ -150,6 +156,9 @@ function parseArguments(argv) {
         const merged = { ...policy };
         if (value('tr-fetch-max-crl-bytes') !== undefined) {
             merged.maxCrlBytes = value('tr-fetch-max-crl-bytes');
+        }
+        if (value('tr-fetch-crl-certificate-cache-size') !== undefined) {
+            merged.crlCertificateCacheSize = value('tr-fetch-crl-certificate-cache-size');
         }
         // tr-curl streams CRLs by default: its cache lasts one run anyway.
         merged.crlCacheScope = value('tr-fetch-crl-cache-scope') ?? merged.crlCacheScope ?? 'certificate';

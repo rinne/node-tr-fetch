@@ -71,7 +71,10 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
     }
     const issuerId = createHash('sha256').update(peer.issuerCertificate.raw).digest('hex');
     const certificateId = createHash('sha256').update(peer.raw).digest('hex');
-    const limits = [ options.cacheSize, options.cacheTTL ];
+    // The CRL cache and the per-certificate result cache have their own
+    // sizes and share the TTL.
+    const limits = [ options.policy.crlCacheSize, options.policy.crlCacheTTL ];
+    const resultLimits = [ options.policy.crlCertificateCacheSize, options.policy.crlCacheTTL ];
     function unreachable(source, cause) {
         failures.push(issue('unreachableCrlDistributionPoint',
                             `Unreachable CRL distribution point ${sourceLabel(source)}: ${cause.message}`, cause, source));
@@ -143,12 +146,12 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
         }
         const group = issuerId + ':' + url.href;
         const key = issuerId + ':' + certificateId + ':' + url.href;
-        const cached = resultCache.lookup(key, ...limits, options.policy.maxCrlBytes, Date.now(), debug);
+        const cached = resultCache.lookup(key, ...resultLimits, options.policy.maxCrlBytes, Date.now(), debug);
         if (cached) {
             return { revoked: cached.listed, nextUpdate: cached.nextUpdate };
         }
         const serial = Buffer.from(certificate.serialNumber.valueBlock.valueHexView);
-        const candidates = resultCache.candidates(group, key, ...limits);
+        const candidates = resultCache.candidates(group, key, ...resultLimits);
         const serials = [ serial, ...candidates.map(([, entry]) => entry.serial) ];
         let streamed;
         try {
@@ -187,7 +190,7 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
             const { expiresAt, lastUsedAt, ...facts } = entry;
             void expiresAt;
             void lastUsedAt;
-            resultCache.store(otherKey, { ...facts, ...common, listed: isListed(entry.serial) }, ...limits, Date.now(), debug, false);
+            resultCache.store(otherKey, { ...facts, ...common, listed: isListed(entry.serial) }, ...resultLimits, Date.now(), debug, false);
         }
         let result;
         try {
@@ -199,7 +202,7 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
             return undefined;
         }
         resultCache.store(key, { issuerId, certificateId, url: url.href, group, serial, isCA: isCaCertificate(certificate),
-                                 urls: [ ...point.urls ], listed: result.revoked, ...common }, ...limits, Date.now(), debug, true);
+                                 urls: [ ...point.urls ], listed: result.revoked, ...common }, ...resultLimits, Date.now(), debug, true);
         return result;
     }
 
@@ -246,8 +249,8 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
 async function checkChain(peer, hostname, options, signal) {
     const debug = options.debug;
     debug?.('TLS verified; starting revocation checks', { hostname });
-    const crlDepth = options.policy.disabled ? -1 : options.checkDepth;
-    const ocspDepth = options.ocspPolicy.disabled ? -1 : options.ocspCheckDepth;
+    const crlDepth = options.policy.disabled ? -1 : options.policy.crlCheckDepth;
+    const ocspDepth = options.ocspPolicy.disabled ? -1 : options.ocspPolicy.ocspCheckDepth;
     const maxDepth = Math.max(crlDepth, ocspDepth);
     if (maxDepth < 0) {
         return;

@@ -6,6 +6,10 @@ const DEFAULT_POLICY = {
     disabled: false,
     maxCrlBytes: DEFAULT_MAX_CRL_BYTES,
     crlCacheScope: 'crl',
+    crlCacheSize: 32,
+    crlCertificateCacheSize: 1024,
+    crlCacheTTL: 1800,
+    crlCheckDepth: 0,
     missingCrlDistributionPoint: 'ignore',
     unreachableCrlDistributionPoint: 'reject',
     invalidCrl: 'reject',
@@ -14,15 +18,15 @@ const DEFAULT_POLICY = {
 
 const DEFAULT_OCSP_POLICY = {
     disabled: false,
+    ocspCheckDepth: 0,
     missingOcspUri: 'ignore',
     unreachableOcspUri: 'reject',
     rejectedCertificate: 'reject'
 };
 
 const CUSTOM_OPTIONS = [
-    'trFetchCrlPolicy', 'trFetchCrlCacheSize', 'trFetchCrlCacheTTL',
-    'trFetchCrlDistributionPointOverride', 'trFetchCrlOverride', 'trFetchCrlCheckDepth',
-    'trFetchOcspPolicy', 'trFetchOcspUriOverride', 'trFetchOcspCheckDepth', 'trFetchDebug'
+    'trFetchCrlPolicy', 'trFetchCrlDistributionPointOverride', 'trFetchCrlOverride',
+    'trFetchOcspPolicy', 'trFetchOcspUriOverride', 'trFetchDebug'
 ];
 
 const FETCH_OPTIONS = [
@@ -69,6 +73,19 @@ function parsePolicy(value, defaults, name) {
                 throw new TypeError(`${name}.crlCacheScope must be crl or certificate`);
             }
             policy.crlCacheScope = setting;
+        } else if ((key === 'crlCacheSize') || (key === 'crlCertificateCacheSize')) {
+            // Entries; 0 or less disables that cache. Null means the default.
+            if ((setting != null) && ! Number.isSafeInteger(setting)) {
+                throw new TypeError(`${name}.${key} must be a safe integer`);
+            }
+            policy[key] = setting ?? defaults[key];
+        } else if (key === 'crlCacheTTL') {
+            if ((setting != null) && (! Number.isSafeInteger(setting) || (setting < -1))) {
+                throw new TypeError(`${name}.crlCacheTTL must be -1 or a nonnegative safe integer (seconds)`);
+            }
+            policy.crlCacheTTL = setting ?? defaults.crlCacheTTL;
+        } else if ((key === 'crlCheckDepth') || (key === 'ocspCheckDepth')) {
+            policy[key] = parseDepth(setting, `${name}.${key}`);
         } else {
             if (! [ 'ignore', 'warn', 'reject' ].includes(setting)) {
                 throw new TypeError(`${name}.${key} must be ignore, warn or reject`);
@@ -109,22 +126,12 @@ function splitOptions(options) {
     }
     const policy = parsePolicy(fetchOptions.trFetchCrlPolicy, DEFAULT_POLICY, 'trFetchCrlPolicy');
     const ocspPolicy = parsePolicy(fetchOptions.trFetchOcspPolicy, DEFAULT_OCSP_POLICY, 'trFetchOcspPolicy');
-    const cacheSize = fetchOptions.trFetchCrlCacheSize ?? 32;
-    const cacheTTL = fetchOptions.trFetchCrlCacheTTL ?? 1800;
-    const checkDepth = parseDepth(fetchOptions.trFetchCrlCheckDepth, 'trFetchCrlCheckDepth');
-    const ocspCheckDepth = parseDepth(fetchOptions.trFetchOcspCheckDepth, 'trFetchOcspCheckDepth');
     let ocspUri = fetchOptions.trFetchOcspUriOverride;
     if (ocspUri instanceof URL) {
         ocspUri = ocspUri.href;
     }
     if ((ocspUri !== undefined) && (typeof(ocspUri) !== 'string')) {
         throw new TypeError('trFetchOcspUriOverride must be a URL string or URL');
-    }
-    if (! Number.isSafeInteger(cacheSize)) {
-        throw new TypeError('trFetchCrlCacheSize must be a safe integer');
-    }
-    if (! Number.isSafeInteger(cacheTTL) || (cacheTTL < -1)) {
-        throw new TypeError('trFetchCrlCacheTTL must be -1 or a nonnegative safe integer (seconds)');
     }
     let distributionPoint = fetchOptions.trFetchCrlDistributionPointOverride;
     let crl = fetchOptions.trFetchCrlOverride;
@@ -154,8 +161,7 @@ function splitOptions(options) {
     if (fetchOptions.dispatcher !== undefined) {
         throw new TypeError('trFetch cannot safely combine CRL checking with a custom dispatcher');
     }
-    return { fetchOptions, policy, cacheSize, cacheTTL, checkDepth, distributionPoint, crl,
-             ocspPolicy, ocspUri, ocspCheckDepth, debugEnabled };
+    return { fetchOptions, policy, distributionPoint, crl, ocspPolicy, ocspUri, debugEnabled };
 }
 
 module.exports = { DEFAULT_MAX_CRL_BYTES, splitOptions };

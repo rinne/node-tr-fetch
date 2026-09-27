@@ -378,6 +378,24 @@ test('--tr-fetch-crl-cache-scope selects the CRL cache scope; tr-curl defaults t
     }
 });
 
+test('--tr-fetch-crl-certificate-cache-size sets trFetchCrlPolicy.crlCertificateCacheSize', async function() {
+    assert.match((await curl([ '--help' ])).stdout, /--tr-fetch-crl-certificate-cache-size <count>/);
+    const size = async args => {
+        const result = await curl([ '-s', '-v', '--cacert', caFile, '-o', path.join(tmp, 'size'), ...args, secureUrl ]);
+        assert.equal(result.code, 0, args.join(' '));
+        return Number(result.stderr.match(/"crlCertificateCacheSize":(-?\d+)/)[1]);
+    };
+    assert.equal(await size([]), 1024);
+    assert.equal(await size([ '--tr-fetch-crl-certificate-cache-size', '5' ]), 5);
+    assert.equal(await size([ '--tr-fetch-crl-certificate-cache-size', '0' ]), 0);
+    assert.equal(await size([ '--tr-fetch-crl-certificate-cache-size', '-3' ]), -3);
+    assert.equal(await size([ '--tr-fetch-options', '{"trFetchCrlPolicy":{"crlCertificateCacheSize":7}}' ]), 7);
+    assert.equal(await size([ '--tr-fetch-crl-certificate-cache-size=9', '--tr-fetch-options', '{"trFetchCrlPolicy":{"crlCertificateCacheSize":7}}' ]), 9);
+    for (const value of [ '1.5', '1k', '', '99999999999999999', '--' ]) {
+        assert.equal((await curl([ '-s', '--tr-fetch-crl-certificate-cache-size', value, secureUrl ])).code, 2, value);
+    }
+});
+
 test('--insecure bypasses TLS verification and revocation checks', async function() {
     assert.equal((await curl([ '-s', untrustedUrl ])).code, 60);
     let result = await curl([ '-s', '-k', untrustedUrl ]);

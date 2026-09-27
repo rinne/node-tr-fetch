@@ -76,17 +76,56 @@ test('cache diagnostics explain misses, hits, expiration, capacity purges and di
 });
 
 test('defaults, partial policy and stripping without mutating caller options', function() {
-    const input = Object.freeze({ method: 'POST', trFetchCrlPolicy: Object.freeze({ invalidCrl: 'warn' }), trFetchCrlCacheTTL: -1 });
+    const input = Object.freeze({ method: 'POST', trFetchCrlPolicy: Object.freeze({ invalidCrl: 'warn', crlCacheTTL: -1 }) });
     const options = splitOptions(input);
     assert.deepEqual(options.fetchOptions, { method: 'POST' });
-    assert.equal(options.cacheSize, 32);
-    assert.equal(options.cacheTTL, -1);
     assert.deepEqual(options.policy, {
-        disabled: false, maxCrlBytes: 16777216, crlCacheScope: 'crl',
+        disabled: false, maxCrlBytes: 16777216, crlCacheScope: 'crl', crlCacheSize: 32, crlCertificateCacheSize: 1024,
+        crlCacheTTL: -1, crlCheckDepth: 0,
         missingCrlDistributionPoint: 'ignore', unreachableCrlDistributionPoint: 'reject', invalidCrl: 'warn', revokedCertificate: 'reject'
     });
-    assert.equal(splitOptions().cacheTTL, 1800);
-    assert.equal(splitOptions().checkDepth, 0);
+    assert.equal(splitOptions().policy.crlCacheTTL, 1800);
+    assert.equal(splitOptions().policy.crlCheckDepth, 0);
+    assert.deepEqual(Object.keys(splitOptions()).sort(), [ 'crl', 'debugEnabled', 'distributionPoint', 'fetchOptions', 'ocspPolicy',
+        'ocspUri', 'policy' ]);
+});
+
+test('cache sizes, TTL and check depths are policy settings; the former top-level options are unknown', function() {
+    for (const key of [ 'crlCacheSize', 'crlCertificateCacheSize' ]) {
+        for (const value of [ -32, 0, 1, 5000, Number.MAX_SAFE_INTEGER ]) {
+            assert.equal(splitOptions({ trFetchCrlPolicy: { [key]: value } }).policy[key], value, key);
+        }
+        for (const value of [ undefined, null ]) {
+            assert.equal(splitOptions({ trFetchCrlPolicy: { [key]: value } }).policy[key], (key === 'crlCacheSize') ? 32 : 1024);
+        }
+        for (const value of [ 1.2, Infinity, NaN, '32', true, 2 ** 53 ]) {
+            assert.throws(() => splitOptions({ trFetchCrlPolicy: { [key]: value } }), new RegExp(`${key} must be a safe integer`));
+        }
+    }
+    for (const value of [ -1, 0, 1, 86400 ]) {
+        assert.equal(splitOptions({ trFetchCrlPolicy: { crlCacheTTL: value } }).policy.crlCacheTTL, value);
+    }
+    assert.equal(splitOptions({ trFetchCrlPolicy: { crlCacheTTL: null } }).policy.crlCacheTTL, 1800);
+    for (const value of [ -2, 1.5, Infinity, '1800', true ]) {
+        assert.throws(() => splitOptions({ trFetchCrlPolicy: { crlCacheTTL: value } }), /crlCacheTTL must be -1 or a nonnegative safe integer/);
+    }
+    for (const [key, policy] of [ [ 'crlCheckDepth', 'trFetchCrlPolicy' ], [ 'ocspCheckDepth', 'trFetchOcspPolicy' ] ]) {
+        for (const [input, output] of [ [ undefined, 0 ], [ null, 0 ], [ 0, 0 ], [ 1, 1 ], [ 10, 10 ], [ 'leaf', 0 ], [ 'full-chain', Infinity ] ]) {
+            const result = splitOptions({ [policy]: { [key]: input } });
+            assert.equal(result[(policy === 'trFetchCrlPolicy') ? 'policy' : 'ocspPolicy'][key], output, `${key} ${input}`);
+            assert.deepEqual(result.fetchOptions, {});
+        }
+        for (const input of [ -1, 1.5, Infinity, 'all', '1' ]) {
+            assert.throws(() => splitOptions({ [policy]: { [key]: input } }), new RegExp(`${policy}\\.${key} must be`));
+        }
+    }
+    for (const key of [ 'crlCacheSize', 'crlCertificateCacheSize', 'crlCacheTTL', 'crlCheckDepth' ]) {
+        assert.throws(() => splitOptions({ trFetchOcspPolicy: { [key]: 0 } }), /Unknown trFetchOcspPolicy property/);
+    }
+    assert.throws(() => splitOptions({ trFetchCrlPolicy: { ocspCheckDepth: 0 } }), /Unknown trFetchCrlPolicy property/);
+    for (const key of [ 'trFetchCrlCacheSize', 'trFetchCrlCacheTTL', 'trFetchCrlCheckDepth', 'trFetchOcspCheckDepth' ]) {
+        assert.throws(() => splitOptions({ [key]: 0 }), new RegExp(`Unknown trFetch option: ${key}`));
+    }
 });
 
 test('maxCrlBytes accepts only an explicit positive number of bytes, and only for CRLs', function() {
@@ -102,21 +141,13 @@ test('maxCrlBytes accepts only an explicit positive number of bytes, and only fo
 test('reject unknown policy keys, invalid values, conflicting overrides and custom dispatchers', function() {
     for (const options of [
         { trFetchBogus: true }, { trFetchCrlPolicy: null }, { trFetchCrlPolicy: { invalidCrl: 'allow' } },
-        { trFetchCrlPolicy: { typo: 'ignore' } }, { trFetchCrlCacheSize: 1.2 }, { trFetchCrlCacheTTL: -2 },
-        { trFetchCrlCacheTTL: Infinity }, { trFetchCrlOverride: {} }, { trFetchCrlDistributionPointOverride: null },
+        { trFetchCrlPolicy: { typo: 'ignore' } }, { trFetchCrlPolicy: { crlCacheSize: 1.2 } }, { trFetchCrlPolicy: { crlCacheTTL: -2 } },
+        { trFetchCrlPolicy: { crlCacheTTL: Infinity } }, { trFetchCrlOverride: {} }, { trFetchCrlDistributionPointOverride: null },
         { trFetchCrlOverride: '', trFetchCrlDistributionPointOverride: '' }, { dispatcher: {} },
-        { trFetchCrlCheckDepth: -1 }, { trFetchCrlCheckDepth: Infinity }, { trFetchCrlCheckDepth: 'all' }
+        { trFetchCrlPolicy: { crlCheckDepth: -1 } }, { trFetchCrlPolicy: { crlCheckDepth: Infinity } },
+        { trFetchCrlPolicy: { crlCheckDepth: 'all' } }
     ]) {
         assert.throws(() => splitOptions(options), TypeError);
-    }
-    assert.equal(splitOptions({ trFetchCrlCacheSize: -32 }).cacheSize, -32);
-});
-
-test('numeric and named CRL check depth', function() {
-    for (const [input, output] of [ [ 0, 0 ], [ 1, 1 ], [ 10, 10 ], [ 'leaf', 0 ], [ 'full-chain', Infinity ] ]) {
-        const result = splitOptions({ trFetchCrlCheckDepth: input });
-        assert.equal(result.checkDepth, output);
-        assert.deepEqual(result.fetchOptions, {});
     }
 });
 
@@ -124,11 +155,11 @@ test('inherited options and non-enumerable security settings cannot be silently 
     assert.throws(() => splitOptions(Object.create({ dispatcher: {} })), /custom dispatcher/);
     assert.throws(() => splitOptions(Object.defineProperty({}, 'dispatcher', { value: {} })), /custom dispatcher/);
     const result = splitOptions(Object.create({
-        method: 'POST', trFetchCrlCheckDepth: 1,
-        trFetchCrlPolicy: Object.create({ missingCrlDistributionPoint: 'reject' })
+        method: 'POST',
+        trFetchCrlPolicy: Object.create({ missingCrlDistributionPoint: 'reject', crlCheckDepth: 1 })
     }));
     assert.equal(result.fetchOptions.method, 'POST');
-    assert.equal(result.checkDepth, 1);
+    assert.equal(result.policy.crlCheckDepth, 1);
     assert.equal(result.policy.missingCrlDistributionPoint, 'reject');
 });
 
@@ -176,11 +207,11 @@ test('CRL URLs accept only HTTP(S), never files, LDAP or URL credentials', funct
 
 test('OCSP defaults, depth, override and disabled policy options are validated and stripped', function() {
     assert.deepEqual(splitOptions().ocspPolicy, {
-        disabled: false, missingOcspUri: 'ignore', unreachableOcspUri: 'reject', rejectedCertificate: 'reject'
+        disabled: false, ocspCheckDepth: 0, missingOcspUri: 'ignore', unreachableOcspUri: 'reject', rejectedCertificate: 'reject'
     });
     for (const [depth, expected] of [ [ undefined, 0 ], [ 0, 0 ], [ 'leaf', 0 ], [ 2, 2 ], [ 'full-chain', Infinity ] ]) {
-        const result = splitOptions({ trFetchOcspCheckDepth: depth, trFetchOcspUriOverride: new URL('https://ca.example/ocsp') });
-        assert.equal(result.ocspCheckDepth, expected);
+        const result = splitOptions({ trFetchOcspPolicy: { ocspCheckDepth: depth }, trFetchOcspUriOverride: new URL('https://ca.example/ocsp') });
+        assert.equal(result.ocspPolicy.ocspCheckDepth, expected);
         assert.equal(result.ocspUri, 'https://ca.example/ocsp');
         assert.deepEqual(result.fetchOptions, {});
     }
@@ -194,7 +225,8 @@ test('OCSP defaults, depth, override and disabled policy options are validated a
         }
     }
     for (const options of [ { trFetchOcspPolicy: null }, { trFetchOcspPolicy: { missingOcspUri: 'allow' } },
-                            { trFetchOcspPolicy: { typo: 'ignore' } }, { trFetchOcspCheckDepth: -1 }, { trFetchOcspCheckDepth: 1.5 },
+                            { trFetchOcspPolicy: { typo: 'ignore' } }, { trFetchOcspPolicy: { ocspCheckDepth: -1 } },
+                            { trFetchOcspPolicy: { ocspCheckDepth: 1.5 } },
                             { trFetchOcspUriOverride: null }, { trFetchOcspUriOverride: {} } ]) {
         assert.throws(() => splitOptions(options), TypeError);
     }
