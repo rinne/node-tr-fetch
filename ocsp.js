@@ -200,6 +200,11 @@ async function validateOcspResponse(bytes, request, certificate, issuer, now = D
     return { status: [ 'good', 'revoked', 'unknown' ][tag], nextUpdate: expiresAt };
 }
 
+// Check a certificate with OCSP. Returns { answered, nextUpdate } for an
+// authenticated good or revoked status, applying the rejectedCertificate
+// policy if revoked. Otherwise, including for an unknown status, returns
+// { answered: false, failures }: the conditions whose policies the caller
+// applies, or drops when another check answers.
 async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug) {
     const policy = options.ocspPolicy;
     const label = `${leaf ? 'server' : 'intermediate CA'} certificate ${peer.serialNumber} for ${JSON.stringify(hostname)}`;
@@ -219,11 +224,15 @@ async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug
                                                    action: (result.status === 'good') ? 'continue' : policy.rejectedCertificate,
                                                    nextUpdate: result.nextUpdate, cached: result.cached });
         if (result.status !== 'good') {
-            applyPolicy(policy, issue('rejectedCertificate',
-                                      `OCSP rejected certificate: responder reports ${result.status}`, uri, undefined, result.status), responderDebug,
-                        options.warningCb);
+            const rejected = issue('rejectedCertificate', `OCSP rejected certificate: responder reports ${result.status}`, uri, undefined,
+                                   result.status);
+            if (result.status === 'unknown') {
+                // The responder does not know the certificate: no status.
+                return { answered: false, failures: [ rejected ] };
+            }
+            applyPolicy(policy, rejected, responderDebug, options.warningCb);
         }
-        return result.nextUpdate;
+        return { answered: true, nextUpdate: result.nextUpdate };
     }
     let certificate, uris, issuer, request;
     try {
@@ -235,12 +244,11 @@ async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug
             });
         }
     } catch (cause) {
-        applyPolicy(policy, issue('rejectedCertificate', `Cannot read OCSP certificate information: ${cause.message}`, undefined, cause, 'invalid-response'), debug, options.warningCb);
-        return;
+        return { answered: false, failures: [ issue('rejectedCertificate', `Cannot read OCSP certificate information: ${cause.message}`,
+                                                    undefined, cause, 'invalid-response') ] };
     }
     if (! uris.length) {
-        applyPolicy(policy, issue('missingOcspUri', 'Missing OCSP responder URI'), debug, options.warningCb);
-        return;
+        return { answered: false, failures: [ issue('missingOcspUri', 'Missing OCSP responder URI') ] };
     }
     // Cached results are keyed by issuer, certificate and responder URL, and
     // are looked up before an OCSP request is built.
@@ -260,8 +268,8 @@ async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug
         issuer = parseCertificate(peer.issuerCertificate.raw);
         request = await createOcspRequest(certificate, issuer);
     } catch (cause) {
-        applyPolicy(policy, issue('rejectedCertificate', `Cannot prepare OCSP verification: ${cause.message}`, undefined, cause, 'invalid-response'), debug, options.warningCb);
-        return;
+        return { answered: false, failures: [ issue('rejectedCertificate', `Cannot prepare OCSP verification: ${cause.message}`,
+                                                    undefined, cause, 'invalid-response') ] };
     }
     const failures = [];
     for (const uri of uris.slice(0, 32)) {
@@ -292,9 +300,7 @@ async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug
     if (uris.length > 32) {
         failures.push(issue('unreachableOcspUri', 'OCSP responder URI lookup limit (32) exceeded'));
     }
-    for (const failure of failures) {
-        applyPolicy(policy, failure, debug, options.warningCb);
-    }
+    return { answered: false, failures };
 }
 
 module.exports = { ocspUris, createOcspRequest, validateOcspResponse, checkOcspCertificate };

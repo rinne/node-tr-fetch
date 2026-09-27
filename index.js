@@ -3,7 +3,7 @@
 const { splitOptions } = require('./options');
 const { assertDefaultDispatcher, assertVerifiedResponse, createAgent } = require('./transport');
 const { checkChain } = require('./check');
-const { TrFetchCrlError, TrFetchOcspError } = require('./errors');
+const { TrFetchRevocationError, TrFetchCrlError, TrFetchOcspError } = require('./errors');
 const { createDebug, debugUrl } = require('./debug');
 
 async function trFetch(input, options) {
@@ -26,7 +26,9 @@ async function trFetch(input, options) {
         ocsp: config.ocspPolicy.disabled ? 'disabled' : 'enabled',
         ocspDepth: (config.ocspPolicy.ocspCheckDepth === Infinity) ? 'full-chain' : config.ocspPolicy.ocspCheckDepth,
         ocspCacheSize: config.ocspPolicy.ocspCacheSize,
-        ocspCacheTTL: config.ocspPolicy.ocspCacheTTL
+        ocspCacheTTL: config.ocspPolicy.ocspCacheTTL,
+        strategy: config.revocationPolicy.strategy,
+        noRevocationStatus: config.revocationPolicy.noRevocationStatus
     });
     const check = (config.policy.disabled && config.ocspPolicy.disabled) ? undefined :
           (peer, hostname) => checkChain(peer, hostname, config, signal);
@@ -51,7 +53,7 @@ async function trFetch(input, options) {
             throw signal.reason;
         }
         for (let cause = error; cause; cause = cause.cause) {
-            if ((cause instanceof TrFetchCrlError) || (cause instanceof TrFetchOcspError)) {
+            if (cause instanceof TrFetchRevocationError) {
                 throw cause;
             }
         }
@@ -60,5 +62,6 @@ async function trFetch(input, options) {
 }
 
 module.exports = trFetch;
+module.exports.TrFetchRevocationError = TrFetchRevocationError;
 module.exports.TrFetchCrlError = TrFetchCrlError;
 module.exports.TrFetchOcspError = TrFetchOcspError;

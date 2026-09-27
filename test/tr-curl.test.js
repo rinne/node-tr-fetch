@@ -13,7 +13,7 @@ const fixtures = require('./fixtures');
 
 const BIN = path.join(__dirname, '..', 'bin', 'tr-curl.js');
 
-let tmp, ca, caFile, server, base, secure, secureUrl, revoked, revokedUrl, untrusted, untrustedUrl;
+let tmp, ca, caFile, server, base, secure, secureUrl, revoked, revokedUrl, untrusted, untrustedUrl, bare, bareUrl;
 const routes = new Map();
 
 function curl(args, options = {}) {
@@ -79,6 +79,8 @@ test.before(async function() {
     [ revoked, revokedUrl ] = await httpsServer(await fixtures.certificate({ issuer: ca, serial: 43,
                                                                              urls: [ base + '/crl-revoked' ], ocspUrls: [ base + '/ocsp-revoked' ] }));
     [ untrusted, untrustedUrl ] = await httpsServer(await fixtures.certificate({ issuer: await fixtures.certificate({ ca: true, serial: 7 }) }));
+    // Trusted, but with no CRL distribution point or OCSP responder.
+    [ bare, bareUrl ] = await httpsServer(await fixtures.certificate({ issuer: ca, serial: 45 }));
     routes.set('/redirect', function(req, res) {
         res.writeHead(Number(new URL(req.url, base).searchParams.get('status') ?? 302), {
             location: new URL(req.url, base).searchParams.get('to') ?? '/echo'
@@ -98,7 +100,7 @@ test.before(async function() {
 });
 
 test.after(async function() {
-    for (const value of [ server, secure, revoked, untrusted ]) {
+    for (const value of [ server, secure, revoked, untrusted, bare ]) {
         value.closeAllConnections();
         await new Promise(resolve => value.close(resolve));
     }
@@ -416,6 +418,33 @@ test('--tr-fetch-ocsp-cache-size and --tr-fetch-ocsp-cache-ttl set the OCSP cach
     assert.equal(merged.code, 0);
     for (const args of [ [ '--tr-fetch-ocsp-cache-size', '1.5' ], [ '--tr-fetch-ocsp-cache-size', 'x' ], [ '--tr-fetch-ocsp-cache-ttl', '-2' ],
         [ '--tr-fetch-ocsp-cache-ttl', '1.5' ], [ '--tr-fetch-ocsp-cache-ttl', '' ] ]) {
+        assert.equal((await curl([ '-s', ...args, secureUrl ])).code, 2, args.join(' '));
+    }
+});
+
+test('--tr-fetch-revocation-strategy and --tr-fetch-no-revocation-status set the certificate revocation policy', async function() {
+    const help = (await curl([ '--help' ])).stdout;
+    assert.match(help, /--tr-fetch-revocation-strategy <both\|ocsp-first\|crl-first>/);
+    assert.match(help, /--tr-fetch-no-revocation-status <ignore\|warn\|reject>/);
+    const settings = async args => {
+        const result = await curl([ '-s', '-v', '--cacert', caFile, '-o', path.join(tmp, 'strategy'), ...args, secureUrl ]);
+        assert.equal(result.code, 0, args.join(' '));
+        return [ result.stderr.match(/"strategy":"([a-z-]+)"/)[1], result.stderr.match(/"noRevocationStatus":"([a-z]+)"/)[1],
+            /CRL check skipped.*status established by OCSP/.test(result.stderr) ];
+    };
+    assert.deepEqual(await settings([]), [ 'both', 'ignore', false ]);
+    assert.deepEqual(await settings([ '--tr-fetch-revocation-strategy', 'ocsp-first', '--tr-fetch-no-revocation-status', 'reject' ]),
+                     [ 'ocsp-first', 'reject', true ]);
+    assert.deepEqual(await settings([ '--tr-fetch-options', '{"trFetchCertificateRevocationPolicy":{"strategy":"crl-first"}}',
+        '--tr-fetch-no-revocation-status=warn' ]), [ 'crl-first', 'warn', false ]);
+    // With OCSP first, the revoked server's OCSP responder decides (exit 91).
+    const revoked = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-revocation-strategy', 'ocsp-first', revokedUrl ]);
+    assert.equal(revoked.code, 91);
+    // No revocation status at all: exit 91, like other unverifiable statuses.
+    const bare = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-no-revocation-status', 'reject', bareUrl ]);
+    assert.equal(bare.code, 91);
+    assert.match(bare.stderr, /No revocation status established/);
+    for (const args of [ [ '--tr-fetch-revocation-strategy', 'either' ], [ '--tr-fetch-no-revocation-status', 'allow' ] ]) {
         assert.equal((await curl([ '-s', ...args, secureUrl ])).code, 2, args.join(' '));
     }
 });

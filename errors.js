@@ -7,9 +7,12 @@ const CODES = {
     revokedCertificate: 'TR_FETCH_CERTIFICATE_REVOKED',
     missingOcspUri: 'TR_FETCH_OCSP_MISSING_URI',
     unreachableOcspUri: 'TR_FETCH_OCSP_UNREACHABLE_URI',
-    rejectedCertificate: 'TR_FETCH_OCSP_CERTIFICATE_REJECTED'
+    rejectedCertificate: 'TR_FETCH_OCSP_CERTIFICATE_REJECTED',
+    noRevocationStatus: 'TR_FETCH_REVOCATION_STATUS_UNAVAILABLE'
 };
 
+// The base class of CRL and OCSP errors. Used directly when no check could
+// establish a certificate's revocation status (noRevocationStatus).
 class TrFetchRevocationError extends Error {
     constructor(policyKey, message, details = {}, cause) {
         super(`trFetch: ${message}`, (cause === undefined) ? undefined : { cause });
@@ -44,7 +47,8 @@ function callbackFireAndForget(...args) {
 // warningCb when given, and to process.emitWarning otherwise.
 function applyPolicy(policy, error, debug, warningCb) {
     const action = policy[error.policyKey];
-    debug?.((error instanceof TrFetchOcspError) ? 'OCSP policy applied' : 'CRL policy applied', {
+    const kind = (error instanceof TrFetchOcspError) ? 'OCSP' : (error instanceof TrFetchCrlError) ? 'CRL' : 'Revocation';
+    debug?.(`${kind} policy applied`, {
         policy: error.policyKey, action, code: error.code, reason: error.message
     });
     if (action === 'reject') {
@@ -62,4 +66,4 @@ function applyPolicy(policy, error, debug, warningCb) {
     }
 }
 
-module.exports = { TrFetchCrlError, TrFetchOcspError, applyPolicy, callbackFireAndForget };
+module.exports = { TrFetchRevocationError, TrFetchCrlError, TrFetchOcspError, applyPolicy, callbackFireAndForget };

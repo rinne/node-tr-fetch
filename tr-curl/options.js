@@ -117,6 +117,10 @@ function optionDefinitions() {
             value => [ 'crl', 'certificate' ].includes(value) ? value : undefined),
         arg(undefined, 'tr-fetch-crl-certificate-cache-size', '<count> Cached per-certificate CRL results (default 1024; 0 disables)',
             integerCb),
+        arg(undefined, 'tr-fetch-revocation-strategy', '<both|ocsp-first|crl-first> Which revocation checks to run (default both)',
+            value => [ 'both', 'ocsp-first', 'crl-first' ].includes(value) ? value : undefined),
+        arg(undefined, 'tr-fetch-no-revocation-status', '<ignore|warn|reject> When no check establishes a status (default ignore)',
+            value => [ 'ignore', 'warn', 'reject' ].includes(value) ? value : undefined),
         arg(undefined, 'tr-fetch-crl-url', '<url> Fetch the server certificate\'s CRL from this URL instead', networkUrlCb),
         arg(undefined, 'tr-fetch-ocsp-cache-size', '<count> Cached OCSP results (default 1024; 0 disables)', integerCb),
         arg(undefined, 'tr-fetch-ocsp-cache-ttl', '<seconds> Longest OCSP result caching (default 1800; 0 disables, -1 no limit)', ttlCb),
@@ -173,6 +177,10 @@ function parseArguments(argv) {
         crlCertificateCacheSize: value('tr-fetch-crl-certificate-cache-size'),
         // tr-curl streams CRLs by default: its cache lasts one run anyway.
         crlCacheScope: value('tr-fetch-crl-cache-scope') ?? trFetchOptions.trFetchCrlPolicy?.crlCacheScope ?? 'certificate'
+    });
+    mergePolicy('trFetchCertificateRevocationPolicy', {
+        strategy: value('tr-fetch-revocation-strategy'),
+        noRevocationStatus: value('tr-fetch-no-revocation-status')
     });
     mergePolicy('trFetchOcspPolicy', {
         ocspCacheSize: value('tr-fetch-ocsp-cache-size'),

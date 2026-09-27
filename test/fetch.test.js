@@ -786,6 +786,118 @@ test('OCSP results are cached until the earlier of nextUpdate and the TTL, withi
     assert.equal(count('/oc-size'), 5);
 });
 
+test('strategy ocsp-first: OCSP answers alone; without an answer the CRL decides and OCSP failures are dropped', async function(t) {
+    const count = path => crlRequests.filter(x => x.url === path).length;
+    const first = extra => ({ trFetchCertificateRevocationPolicy: { strategy: 'ocsp-first', ...extra } });
+    routes.set('/st-crl-revoked', revokedCrl.der);
+    routes.set('/st-crl-good', goodCrl.der);
+    routes.set('/st-ocsp-good', ocspRoute(ca));
+    // OCSP says good: the CRL, which would revoke, is never fetched.
+    const good = await endpoint(t, { urls: [ crlBase + '/st-crl-revoked' ], ocspUrls: [ crlBase + '/st-ocsp-good' ] });
+    const events = captureDebug(t);
+    assert.equal(await (await trFetch(good.url, { ...first(), trFetchDebug: true })).text(), 'ok');
+    assert.equal(count('/st-crl-revoked'), 0);
+    assert.ok(events.some(x => (x.event === 'CRL check skipped') && (x.reason === 'status established by OCSP')));
+    t.mock.restoreAll();
+    // The same certificate under the default strategy is revoked by its CRL.
+    await assert.rejects(trFetch(good.url, { trFetchOcspPolicy: { ocspCacheTTL: 0 } }), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
+    // OCSP revoked is authoritative.
+    routes.set('/st-ocsp-revoked', ocspRoute(ca, { status: 'revoked' }));
+    const revoked = await endpoint(t, { urls: [ crlBase + '/st-crl-good' ], ocspUrls: [ crlBase + '/st-ocsp-revoked' ] });
+    await assert.rejects(trFetch(revoked.url, first()), { code: 'TR_FETCH_OCSP_CERTIFICATE_REJECTED', ocspStatus: 'revoked' });
+    assert.equal(count('/st-crl-good'), 0);
+    // No status from OCSP (unknown, unreachable or no URI at all, even with
+    // rejecting policies): the CRL decides, and the OCSP failure is dropped.
+    routes.set('/st-ocsp-unknown', ocspRoute(ca, { status: 'unknown' }));
+    for (const [ocspUrls, label] of [ [ [ crlBase + '/st-ocsp-unknown' ], 'unknown' ], [ [ crlBase + '/st-ocsp-missing' ], 'unreachable' ],
+        [ undefined, 'no URI' ] ]) {
+        const server = await endpoint(t, { urls: [ crlBase + '/st-crl-good' ], ...(ocspUrls ? { ocspUrls } : {}) });
+        const dropped = captureDebug(t);
+        const options = { ...first(), trFetchDebug: true, trFetchOcspPolicy: { missingOcspUri: 'reject', ocspCacheTTL: 0 } };
+        assert.equal(await (await trFetch(server.url, options)).text(), 'ok', label);
+        assert.ok(dropped.some(x => (x.event === 'Deferred revocation check failures dropped') && (x.answeredBy === 'CRL')), label);
+        t.mock.restoreAll();
+        const listed = await endpoint(t, { urls: [ crlBase + '/st-crl-revoked' ], ...(ocspUrls ? { ocspUrls } : {}) });
+        await assert.rejects(trFetch(listed.url, options), { code: 'TR_FETCH_CERTIFICATE_REVOKED' }, label);
+    }
+    // Neither establishes a status: both failures apply, OCSP's first.
+    const neither = await endpoint(t, { urls: [ crlBase + '/st-crl-missing' ], ocspUrls: [ crlBase + '/st-ocsp-missing' ] });
+    await assert.rejects(trFetch(neither.url, first()), { code: 'TR_FETCH_OCSP_UNREACHABLE_URI' });
+    const warnings = [];
+    await (await trFetch(neither.url, { ...first(), trFetchWarningCb: warning => warnings.push(warning.code),
+        trFetchCrlPolicy: { unreachableCrlDistributionPoint: 'warn' }, trFetchOcspPolicy: { unreachableOcspUri: 'warn' } })).text();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(warnings, [ 'TR_FETCH_OCSP_UNREACHABLE_URI', 'TR_FETCH_CRL_UNREACHABLE_DISTRIBUTION_POINT' ]);
+    assert.equal(neither.hits(), 1);
+});
+
+test('strategy crl-first: the CRL answers alone; without an answer OCSP decides', async function(t) {
+    const count = path => crlRequests.filter(x => x.url === path).length;
+    const first = { trFetchCertificateRevocationPolicy: { strategy: 'crl-first' }, trFetchOcspPolicy: { ocspCacheTTL: 0 } };
+    routes.set('/cf-ocsp-revoked', ocspRoute(ca, { status: 'revoked' }));
+    routes.set('/cf-ocsp-good', ocspRoute(ca));
+    routes.set('/cf-crl-good', goodCrl.der);
+    const good = await endpoint(t, { urls: [ crlBase + '/cf-crl-good' ], ocspUrls: [ crlBase + '/cf-ocsp-revoked' ] });
+    assert.equal(await (await trFetch(good.url, first)).text(), 'ok');
+    assert.equal(count('/cf-ocsp-revoked'), 0);
+    // No distribution point (even with a rejecting policy): OCSP decides.
+    const noCrl = await endpoint(t, { ocspUrls: [ crlBase + '/cf-ocsp-good' ] });
+    assert.equal(await (await trFetch(noCrl.url, { ...first, trFetchCrlPolicy: { missingCrlDistributionPoint: 'reject' } })).text(), 'ok');
+    assert.equal(count('/cf-ocsp-good'), 1);
+    const revoked = await endpoint(t, { ocspUrls: [ crlBase + '/cf-ocsp-revoked' ] });
+    await assert.rejects(trFetch(revoked.url, first), { code: 'TR_FETCH_OCSP_CERTIFICATE_REJECTED' });
+    // The default strategy checks both and applies each failure at once.
+    await assert.rejects(trFetch(noCrl.url, { trFetchCrlPolicy: { missingCrlDistributionPoint: 'reject' } }),
+                         { code: 'TR_FETCH_CRL_MISSING_DISTRIBUTION_POINT' });
+});
+
+test('noRevocationStatus applies when no check establishes a status, per certificate', async function(t) {
+    const policy = noRevocationStatus => ({ trFetchCertificateRevocationPolicy: { noRevocationStatus } });
+    // No revocation information at all; every other policy is satisfied.
+    const bare = await endpoint(t);
+    assert.equal(await (await trFetch(bare.url)).text(), 'ok');
+    await assert.rejects(trFetch(bare.url, policy('reject')), function(error) {
+        assert.ok(error instanceof trFetch.TrFetchRevocationError);
+        assert.ok(! (error instanceof trFetch.TrFetchCrlError) && ! (error instanceof trFetch.TrFetchOcspError));
+        assert.equal(error.name, 'TrFetchRevocationError');
+        assert.equal(error.code, 'TR_FETCH_REVOCATION_STATUS_UNAVAILABLE');
+        assert.equal(error.hostname, 'localhost');
+        assert.equal(error.serialNumber, '2A');
+        assert.match(error.message, /No revocation status established for server certificate 2A/);
+        assert.match(error.reasons.crl, /Missing CRL distribution point/);
+        assert.match(error.reasons.ocsp, /Missing OCSP responder URI/);
+        return true;
+    });
+    assert.equal(bare.hits(), 1);
+    // Unreachable sources with ignoring policies also leave no status.
+    const unreachable = await endpoint(t, { urls: [ crlBase + '/nrs-missing' ], ocspUrls: [ crlBase + '/nrs-missing-ocsp' ] });
+    const ignoring = { trFetchCrlPolicy: { unreachableCrlDistributionPoint: 'ignore' }, trFetchOcspPolicy: { unreachableOcspUri: 'ignore' } };
+    assert.equal(await (await trFetch(unreachable.url, ignoring)).text(), 'ok');
+    for (const strategy of [ 'both', 'ocsp-first', 'crl-first' ]) {
+        await assert.rejects(trFetch(unreachable.url, { ...ignoring, trFetchCertificateRevocationPolicy: { strategy, noRevocationStatus: 'reject' } }),
+                             { code: 'TR_FETCH_REVOCATION_STATUS_UNAVAILABLE' }, strategy);
+    }
+    // warn delivers a TrFetchRevocationWarning.
+    const warnings = [];
+    await (await trFetch(bare.url, { ...policy('warn'), trFetchWarningCb: warning => warnings.push(warning) })).text();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(warnings.map(x => [ x.name, x.code ]), [ [ 'TrFetchRevocationWarning', 'TR_FETCH_REVOCATION_STATUS_UNAVAILABLE' ] ]);
+    // One answer is enough, and disabled checks require nothing.
+    routes.set('/nrs-crl', goodCrl.der);
+    const crlOnly = await endpoint(t, { urls: [ crlBase + '/nrs-crl' ] });
+    assert.equal(await (await trFetch(crlOnly.url, policy('reject'))).text(), 'ok');
+    const disabled = { trFetchCrlPolicy: { disabled: true }, trFetchOcspPolicy: { disabled: true } };
+    assert.equal(await (await trFetch(bare.url, { ...policy('reject'), ...disabled })).text(), 'ok');
+    // Each certificate in the checked depth needs a status: an intermediate
+    // without revocation information fails only when it is within depth.
+    const intermediate = await fixtures.certificate({ issuer: ca, ca: true, serial: 101 });
+    routes.set('/nrs-leaf-crl', (await fixtures.crl(intermediate)).der);
+    const chained = await endpoint(t, { issuer: intermediate, chain: intermediate.pem, urls: [ crlBase + '/nrs-leaf-crl' ] });
+    assert.equal(await (await trFetch(chained.url, policy('reject'))).text(), 'ok');
+    await assert.rejects(trFetch(chained.url, { ...policy('reject'), trFetchCrlPolicy: { crlCheckDepth: 'full-chain' } }),
+                         { code: 'TR_FETCH_REVOCATION_STATUS_UNAVAILABLE', serialNumber: '65' });
+});
+
 test('OCSP revoked and unknown statuses reject before application HTTP data is sent', async function(t) {
     for (const status of [ 'revoked', 'unknown' ]) {
         routes.set('/ocsp-' + status, ocspRoute(ca, { status }));

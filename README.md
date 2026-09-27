@@ -47,12 +47,17 @@ const response = await trFetch(url, {
 		missingOcspUri: 'ignore',
 		unreachableOcspUri: 'reject',
 		rejectedCertificate: 'reject'
+	},
+	trFetchCertificateRevocationPolicy: {
+		strategy: 'both',
+		noRevocationStatus: 'ignore'
 	}
 });
 ```
 
 These are the defaults. Policy objects may specify only the properties to
-change. Both checks are enabled by default and operate independently. Each
+change. Both checks are enabled by default and operate independently (see
+[Revocation strategy](#revocation-strategy) for alternatives). Each
 failure policy (in the table below) accepts `'ignore'`, `'warn'` or
 `'reject'`; the other policy settings are described in their own sections.
 
@@ -65,6 +70,7 @@ failure policy (in the table below) accepts `'ignore'`, `'warn'` or
 | `missingOcspUri` | No OCSP access location is advertised in the certificate's Authority Information Access extension, and no applicable override is set. |
 | `unreachableOcspUri` | Forbidden URI scheme, download failure, non-200 HTTP response, timeout, excessive redirects or response size. |
 | `rejectedCertificate` | OCSP reports revoked or unknown; or the response is malformed, unsuccessful, stale, incorrectly signed, unauthorized, mismatched or otherwise unsupported. |
+| `noRevocationStatus` | In `trFetchCertificateRevocationPolicy`: no enabled check established the certificate's revocation status. |
 
 `ignore` continues without a warning. `warn` emits a Node.js process warning and
 continues. `reject` rejects the fetch promise before sending the HTTP request
@@ -135,6 +141,46 @@ A download failure or an invalid CRL leaves other entries unchanged. The CRL
 cache and this result cache are separate: `crlCacheSize` limits the first
 and `crlCertificateCacheSize` the second, and `crlCacheTTL` applies to both
 (see [Cache](#cache)).
+
+### Revocation strategy
+
+`trFetchCertificateRevocationPolicy` decides how the two checks combine.
+
+`strategy` accepts:
+
+| Value | Behavior |
+|---|---|
+| `'both'` (default) | Every enabled check runs, CRL first, and each check's failures are handled by its own policy at once. |
+| `'ocsp-first'` | OCSP runs first. The CRL is checked only if OCSP did not establish the status. |
+| `'crl-first'` | The CRL is checked first. OCSP runs only if the CRL did not establish the status. |
+
+A check **establishes the status** when it produces an authenticated answer:
+OCSP `good` or `revoked`, or a valid CRL that lists or does not list the
+certificate. A revocation is authoritative: its policy applies immediately and
+the other check does not run. A missing URI or distribution point, an
+unreachable source, an invalid response and an OCSP `unknown` status establish
+nothing.
+
+With `'ocsp-first'` or `'crl-first'`, the first check's failures are deferred.
+If the second check establishes the status, they are dropped (debug output
+records them); otherwise the first check's failure policies apply, followed by
+the second's. So `'ocsp-first'` with the default policies uses the CRL only
+for certificates whose OCSP responder is absent, unreachable or unhelpful, and
+never downloads the CRL of a certificate that OCSP answers for.
+
+`noRevocationStatus` (`'ignore'` by default, `'warn'` or `'reject'`) applies
+when no enabled check established the status of a certificate, for any of the
+reasons above, after the checks' own policies. It requires at least one check
+to have actually been done: for example, a certificate with neither a CRL
+distribution point nor an OCSP URI satisfies the default
+`missingCrlDistributionPoint` and `missingOcspUri` policies, but not
+`noRevocationStatus: 'reject'`.
+
+Both settings apply per certificate: with a check depth beyond the leaf, each
+checked intermediate needs a status of its own, and each check runs only for
+certificates within its own depth. Disabled checks and certificates beyond
+both depths require nothing. The error is a `trFetch.TrFetchRevocationError`
+(see [Errors and warnings](#errors-and-warnings)).
 
 ### Disabling a check
 
@@ -308,8 +354,11 @@ CRL cache options affect only CRLs; OCSP results have their own cache (see
 ## Errors and warnings
 
 CRL rejections are `trFetch.TrFetchCrlError` instances; OCSP rejections are
-`trFetch.TrFetchOcspError` instances. Both are surfaced directly
-instead of being hidden beneath fetch's generic `TypeError: fetch failed`.
+`trFetch.TrFetchOcspError` instances. When no check establishes a status and
+`noRevocationStatus` is `'reject'`, the error is a
+`trFetch.TrFetchRevocationError`, which is also the base class of the other
+two. All are surfaced directly instead of being hidden beneath fetch's generic
+`TypeError: fetch failed`.
 
 | `code` | Policy |
 |---|---|
@@ -320,17 +369,20 @@ instead of being hidden beneath fetch's generic `TypeError: fetch failed`.
 | `TR_FETCH_OCSP_MISSING_URI` | `missingOcspUri` |
 | `TR_FETCH_OCSP_UNREACHABLE_URI` | `unreachableOcspUri` |
 | `TR_FETCH_OCSP_CERTIFICATE_REJECTED` | `rejectedCertificate` |
+| `TR_FETCH_REVOCATION_STATUS_UNAVAILABLE` | `noRevocationStatus` |
 
 Messages explain the specific failure. Certificate errors include `policyKey`,
 `hostname`, `serialNumber`, `fingerprint256`, and, when applicable,
 `distributionPoint` or `ocspUri`, and `cause`. OCSP rejection details include
-`ocspStatus`: `'revoked'`, `'unknown'` or `'invalid-response'`.
+`ocspStatus`: `'revoked'`, `'unknown'` or `'invalid-response'`. A
+`noRevocationStatus` error has `reasons.crl` and `reasons.ocsp`, explaining why
+each check established nothing.
 
 ```js
 try {
 	await trFetch(url);
 } catch (error) {
-	if ((error instanceof trFetch.TrFetchCrlError) || (error instanceof trFetch.TrFetchOcspError)) {
+	if (error instanceof trFetch.TrFetchRevocationError) {
 		console.error(error.code, error.message);
 	} else {
 		throw error;
@@ -338,14 +390,14 @@ try {
 }
 
 process.on('warning', function(warning) {
-	if ([ 'TrFetchCrlWarning', 'TrFetchOcspWarning' ].includes(warning.name)) {
+	if ([ 'TrFetchCrlWarning', 'TrFetchOcspWarning', 'TrFetchRevocationWarning' ].includes(warning.name)) {
 		console.error(warning.code, warning.message);
 	}
 });
 ```
 
-Warnings use the same codes and context, with the names `TrFetchCrlWarning`
-and `TrFetchOcspWarning`. They are Node.js process warnings unless the
+Warnings use the same codes and context, with the names `TrFetchCrlWarning`,
+`TrFetchOcspWarning` and `TrFetchRevocationWarning`. They are Node.js process warnings unless the
 `trFetchWarningCb` option is given, in which case each warning goes to that
 function instead:
 
@@ -547,7 +599,7 @@ tr-curl --cacert private-ca.pem --crlfile current.crl https://internal.example/
 | Failure and limits | `-f/--fail`, `--fail-with-body`, `--fail-early`, `--max-filesize`, `-m/--max-time` |
 | Messages | `-v/--verbose`, `-s/--silent`, `-S/--show-error`, `--no-progress-meter`, `-#/--progress-bar`, `-h/--help`, `-V/--version` |
 | TLS | `-k/--insecure`, `--cacert`, `--crlfile`, `-1/--tlsv1`, `--tlsv1.0` … `--tlsv1.3`, `--tls-max`, `--ciphers`, `--tls13-ciphers` |
-| trFetch | `--tr-fetch-max-crl-bytes`, `--tr-fetch-crl-cache-scope`, `--tr-fetch-crl-certificate-cache-size`, `--tr-fetch-crl-url`, `--tr-fetch-ocsp-cache-size`, `--tr-fetch-ocsp-cache-ttl`, `--tr-fetch-ocsp-url`, `--tr-fetch-options` |
+| trFetch | `--tr-fetch-revocation-strategy`, `--tr-fetch-no-revocation-status`, `--tr-fetch-max-crl-bytes`, `--tr-fetch-crl-cache-scope`, `--tr-fetch-crl-certificate-cache-size`, `--tr-fetch-crl-url`, `--tr-fetch-ocsp-cache-size`, `--tr-fetch-ocsp-cache-ttl`, `--tr-fetch-ocsp-url`, `--tr-fetch-options` |
 
 `--verbose` prints the request and response headers, prefixed with `>` and
 `<` like curl, and also enables `trFetchDebug`, so the revocation diagnostics
@@ -564,15 +616,17 @@ The `--tr-fetch-*` options set trFetch options directly:
 | `--tr-fetch-crl-url <url>` | `trFetchCrlDistributionPointOverride` |
 | `--tr-fetch-ocsp-cache-size <count>` | `trFetchOcspPolicy.ocspCacheSize`, an integer |
 | `--tr-fetch-ocsp-cache-ttl <seconds>` | `trFetchOcspPolicy.ocspCacheTTL`, `-1` or more |
+| `--tr-fetch-revocation-strategy <both\|ocsp-first\|crl-first>` | `trFetchCertificateRevocationPolicy.strategy` |
+| `--tr-fetch-no-revocation-status <ignore\|warn\|reject>` | `trFetchCertificateRevocationPolicy.noRevocationStatus` |
 | `--tr-fetch-ocsp-url <url>` | `trFetchOcspUriOverride` |
 | `--crlfile <file>` | `trFetchCrlOverride`, read from the file |
 
 `--tr-fetch-options` takes a JSON object of any trFetch options, for example
 `'{"trFetchCrlPolicy":{"crlCheckDepth":"full-chain"}}'`. It can be repeated;
 later objects replace earlier keys. The options above take precedence over the
-same settings in it, whatever their order, and the CRL and OCSP cache and size
-options are merged into its `trFetchCrlPolicy` and `trFetchOcspPolicy` rather
-than replacing them.
+same settings in it, whatever their order, and the policy options are merged
+into its `trFetchCrlPolicy`, `trFetchOcspPolicy` and
+`trFetchCertificateRevocationPolicy` rather than replacing them.
 
 `--insecure` cannot be implemented through trFetch, which never relaxes TLS
 verification. With `-k`, tr-curl uses plain fetch with an unverified TLS
@@ -582,7 +636,8 @@ Exit codes follow curl, for example: 1 unsupported protocol, 2 usage error,
 3 malformed URL, 6 unresolvable host, 7 connection failure, 18 partial
 transfer, 22 HTTP error with `--fail`, 23 write error, 28 timeout, 35 TLS
 handshake failure, 47 too many redirects, 60 certificate verification failure
-or CRL rejection, 63 maximum file size exceeded, and 91 OCSP rejection.
+or CRL rejection, 63 maximum file size exceeded, and 91 OCSP rejection or no
+revocation status established.
 
 Differences from curl:
 

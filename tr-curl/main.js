@@ -336,7 +336,9 @@ function failure(error, url, gotResponse) {
     if (error instanceof trFetch.TrFetchCrlError) {
         return new CurlError(60, error.message);
     }
-    if (error instanceof trFetch.TrFetchOcspError) {
+    // OCSP rejections, and no status from any check: the certificate status
+    // could not be verified.
+    if ((error instanceof trFetch.TrFetchOcspError) || (error instanceof trFetch.TrFetchRevocationError)) {
         return new CurlError(91, error.message);
     }
     const causes = [];

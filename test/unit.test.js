@@ -87,7 +87,7 @@ test('defaults, partial policy and stripping without mutating caller options', f
     assert.equal(splitOptions().policy.crlCacheTTL, 1800);
     assert.equal(splitOptions().policy.crlCheckDepth, 0);
     assert.deepEqual(Object.keys(splitOptions()).sort(), [ 'crl', 'debugEnabled', 'distributionPoint', 'fetchOptions', 'ocspPolicy',
-        'ocspUri', 'policy', 'warningCb' ]);
+        'ocspUri', 'policy', 'revocationPolicy', 'warningCb' ]);
 });
 
 test('cache sizes, TTL and check depths are policy settings; the former top-level options are unknown', function() {
@@ -457,4 +457,46 @@ test('the expiring cache reports its own label, and CRL cache events are unchang
         assert.equal(cache.get('i:http://x/', 8, 60, 61000, debug), undefined);
         assert.deepEqual(events, [ 'miss', 'stored', 'hit', 'expired', 'miss' ].map(x => `${label} ${x}`));
     }
+});
+
+test('trFetchCertificateRevocationPolicy: strategy and noRevocationStatus', function() {
+    assert.deepEqual(splitOptions().revocationPolicy, { strategy: 'both', noRevocationStatus: 'ignore' });
+    for (const strategy of [ 'both', 'ocsp-first', 'crl-first' ]) {
+        assert.equal(splitOptions({ trFetchCertificateRevocationPolicy: { strategy } }).revocationPolicy.strategy, strategy);
+    }
+    for (const noRevocationStatus of [ 'ignore', 'warn', 'reject' ]) {
+        const result = splitOptions({ trFetchCertificateRevocationPolicy: { noRevocationStatus } });
+        assert.equal(result.revocationPolicy.noRevocationStatus, noRevocationStatus);
+        assert.deepEqual(result.fetchOptions, {});
+    }
+    for (const strategy of [ 'either', 'OCSP-first', 'ocsp', '', null, undefined, 1 ]) {
+        assert.throws(() => splitOptions({ trFetchCertificateRevocationPolicy: { strategy } }),
+                      /trFetchCertificateRevocationPolicy\.strategy must be both, ocsp-first or crl-first/);
+    }
+    for (const noRevocationStatus of [ 'allow', '', null, true ]) {
+        assert.throws(() => splitOptions({ trFetchCertificateRevocationPolicy: { noRevocationStatus } }),
+                      /noRevocationStatus must be ignore, warn or reject/);
+    }
+    for (const value of [ null, 'both', [], 1 ]) {
+        assert.throws(() => splitOptions({ trFetchCertificateRevocationPolicy: value }), /must be an object/);
+    }
+    for (const key of [ 'disabled', 'missingOcspUri', 'crlCacheSize', 'typo' ]) {
+        assert.throws(() => splitOptions({ trFetchCertificateRevocationPolicy: { [key]: 'ignore' } }),
+                      /Unknown trFetchCertificateRevocationPolicy property/);
+    }
+    for (const key of [ 'strategy', 'noRevocationStatus' ]) {
+        assert.throws(() => splitOptions({ trFetchCrlPolicy: { [key]: 'both' } }), /Unknown trFetchCrlPolicy property/);
+    }
+});
+
+test('TrFetchRevocationError is the base of CRL and OCSP errors and reports noRevocationStatus', function() {
+    const trFetch = require('..');
+    const { TrFetchRevocationError, TrFetchCrlError, TrFetchOcspError } = trFetch;
+    const error = new TrFetchRevocationError('noRevocationStatus', 'no status', { hostname: 'example.com' });
+    assert.equal(error.name, 'TrFetchRevocationError');
+    assert.equal(error.code, 'TR_FETCH_REVOCATION_STATUS_UNAVAILABLE');
+    assert.equal(error.message, 'trFetch: no status');
+    assert.ok(! (error instanceof TrFetchCrlError) && ! (error instanceof TrFetchOcspError));
+    assert.ok(new TrFetchCrlError('invalidCrl', 'x') instanceof TrFetchRevocationError);
+    assert.ok(new TrFetchOcspError('rejectedCertificate', 'x') instanceof TrFetchRevocationError);
 });

@@ -5,7 +5,7 @@ const { parseCertificate, distributionPoints, parseCrl, authenticateCrl, checkRe
     checkDates, checkScope, isCaCertificate } = require('./crl');
 const { authenticateCrlStream } = require('./crlstream');
 const { networkUrl, downloadCrl } = require('./download');
-const { TrFetchCrlError, TrFetchOcspError, applyPolicy } = require('./errors');
+const { TrFetchRevocationError, TrFetchCrlError, TrFetchOcspError, applyPolicy } = require('./errors');
 const { checkOcspCertificate } = require('./ocsp');
 const CrlCache = require('./cache');
 const { CrlResultCache } = require('./cache');
@@ -23,6 +23,11 @@ function sourceLabel(value) {
     }
 }
 
+// Check a certificate against its CRLs. Returns { answered, nextUpdate } when
+// an authenticated CRL gave its status, applying the revokedCertificate policy
+// if it is listed. Otherwise returns { answered: false, failures }: the
+// conditions whose policies the caller applies, or drops when another check
+// answers (see trFetchCertificateRevocationPolicy.strategy).
 async function checkCertificate(peer, hostname, options, signal, override, debug) {
     const details = { hostname, serialNumber: peer.serialNumber, fingerprint256: peer.fingerprint256 };
     const certificateType = override ? 'server' : 'intermediate CA';
@@ -52,12 +57,10 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
             }
         }
     } catch (cause) {
-        applyPolicy(options.policy, issue('invalidCrl', `Cannot read certificate CRL information: ${cause.message}`, cause), debug, options.warningCb);
-        return;
+        return { answered: false, failures: [ issue('invalidCrl', `Cannot read certificate CRL information: ${cause.message}`, cause) ] };
     }
     if (points === undefined) {
-        applyPolicy(options.policy, issue('missingCrlDistributionPoint', 'Missing CRL distribution point'), debug, options.warningCb);
-        return;
+        return { answered: false, failures: [ issue('missingCrlDistributionPoint', 'Missing CRL distribution point') ] };
     }
     let issuer;
     try {
@@ -66,8 +69,7 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
         }
         issuer = parseCertificate(peer.issuerCertificate.raw);
     } catch (cause) {
-        applyPolicy(options.policy, issue('invalidCrl', `Cannot authenticate CRL: ${cause.message}`, cause), debug, options.warningCb);
-        return;
+        return { answered: false, failures: [ issue('invalidCrl', `Cannot authenticate CRL: ${cause.message}`, cause) ] };
     }
     const issuerId = createHash('sha256').update(peer.issuerCertificate.raw).digest('hex');
     const certificateId = createHash('sha256').update(peer.raw).digest('hex');
@@ -235,15 +237,60 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
             if (result.revoked) {
                 applyPolicy(options.policy, issue('revokedCertificate', `Revoked ${certificateType} certificate: serial number is listed in the authenticated CRL`, undefined, source), debug, options.warningCb);
             }
-            return result.nextUpdate;
+            return { answered: true, nextUpdate: result.nextUpdate };
         }
         if (attempts > 32) {
             break;
         }
     }
-    for (const failure of failures) {
-        applyPolicy(options.policy, failure, debug, options.warningCb);
+    return { answered: false, failures };
+}
+
+// Run the enabled checks for one certificate according to the strategy, and
+// apply their failure policies. With 'both', each check runs and its
+// failures are applied at once, in CRL then OCSP order. With 'ocsp-first' or
+// 'crl-first', the second check runs only if the first did not establish the
+// status; the first check's failures are dropped if the second does, and
+// otherwise applied, followed by the second's. Returns the outcomes by kind.
+async function checkRevocation(checks, strategy, debug, warningCb) {
+    const order = (strategy === 'crl-first') ? [ 'CRL', 'OCSP' ] : (strategy === 'ocsp-first') ? [ 'OCSP', 'CRL' ] : [ 'CRL', 'OCSP' ];
+    const outcomes = {};
+    const deferred = [];
+    for (const kind of order) {
+        const check = checks[kind];
+        if (! check.applies) {
+            debug?.(`${kind} check skipped`, { reason: check.disabled ? 'disabled' : 'beyond configured depth' });
+            continue;
+        }
+        const answeredBy = Object.keys(outcomes).find(other => outcomes[other].answered);
+        if ((strategy !== 'both') && answeredBy) {
+            debug?.(`${kind} check skipped`, { reason: `status established by ${answeredBy}`, strategy });
+            continue;
+        }
+        debug?.(`${kind} check started`);
+        const outcome = await check.run();
+        outcomes[kind] = outcome;
+        if (outcome.answered) {
+            if (deferred.length) {
+                debug?.('Deferred revocation check failures dropped', { strategy, answeredBy: kind,
+                                                                        dropped: deferred.map(x => x.error.code) });
+                deferred.length = 0;
+            }
+            continue;
+        }
+        for (const error of outcome.failures) {
+            deferred.push({ policy: check.policy, error });
+        }
+        if (strategy === 'both') {
+            for (const { policy, error } of deferred.splice(0)) {
+                applyPolicy(policy, error, debug, warningCb);
+            }
+        }
     }
+    for (const { policy, error } of deferred) {
+        applyPolicy(policy, error, debug, warningCb);
+    }
+    return outcomes;
 }
 
 async function checkChain(peer, hostname, options, signal) {
@@ -261,6 +308,7 @@ async function checkChain(peer, hostname, options, signal) {
     if (! peer?.raw) {
         throw chainError('TLS connection did not expose a peer certificate');
     }
+    const strategy = options.revocationPolicy.strategy;
     const seen = new Set();
     let nextUpdate = Infinity;
     let ocspNextUpdate = Infinity;
@@ -283,19 +331,33 @@ async function checkChain(peer, hostname, options, signal) {
         const certificateDebug = debug ? (event, details) => debug(event, {
             hostname, certificate: (depth === 0) ? 'leaf' : 'intermediate CA', depth, serial: peer.serialNumber, ...details
         }) : undefined;
-        if (depth <= crlDepth) {
-            certificateDebug?.('CRL check started');
-            const expires = await checkCertificate(peer, hostname, options, signal, depth === 0, certificateDebug);
-            nextUpdate = Math.min(nextUpdate, expires ?? Infinity);
-        } else {
-            certificateDebug?.('CRL check skipped', { reason: options.policy.disabled ? 'disabled' : 'beyond configured depth' });
+        const checks = {
+            CRL: { applies: depth <= crlDepth, policy: options.policy, disabled: options.policy.disabled,
+                   run: () => checkCertificate(peer, hostname, options, signal, depth === 0, certificateDebug) },
+            OCSP: { applies: depth <= ocspDepth, policy: options.ocspPolicy, disabled: options.ocspPolicy.disabled,
+                    run: () => checkOcspCertificate(peer, hostname, options, signal, depth === 0, certificateDebug) }
+        };
+        const outcomes = await checkRevocation(checks, strategy, certificateDebug, options.warningCb);
+        if (outcomes.CRL?.answered) {
+            nextUpdate = Math.min(nextUpdate, outcomes.CRL.nextUpdate ?? Infinity);
         }
-        if (depth <= ocspDepth) {
-            certificateDebug?.('OCSP check started');
-            const expires = await checkOcspCertificate(peer, hostname, options, signal, depth === 0, certificateDebug);
-            ocspNextUpdate = Math.min(ocspNextUpdate, expires ?? Infinity);
-        } else {
-            certificateDebug?.('OCSP check skipped', { reason: options.ocspPolicy.disabled ? 'disabled' : 'beyond configured depth' });
+        if (outcomes.OCSP?.answered) {
+            ocspNextUpdate = Math.min(ocspNextUpdate, outcomes.OCSP.nextUpdate ?? Infinity);
+        }
+        // At least one check had to establish the status, when configured.
+        // Only certificates within some enabled check's depth get here.
+        if (! outcomes.CRL?.answered && ! outcomes.OCSP?.answered) {
+            const reasons = {};
+            for (const kind of [ 'CRL', 'OCSP' ]) {
+                reasons[kind.toLowerCase()] = ! checks[kind].applies ?
+                    (checks[kind].disabled ? 'disabled' : 'beyond configured depth') :
+                    (outcomes[kind] ? outcomes[kind].failures.map(x => x.message.replace(/^trFetch: /, '')).join('; ') : 'not checked');
+            }
+            certificateDebug?.('No revocation status established', { reasons });
+            applyPolicy(options.revocationPolicy, new TrFetchRevocationError('noRevocationStatus',
+                `No revocation status established for ${(depth === 0) ? 'server' : 'intermediate CA'} certificate ${peer.serialNumber} for ` +
+                `${JSON.stringify(hostname)}`, { hostname, serialNumber: peer.serialNumber, fingerprint256: peer.fingerprint256, reasons }),
+                        certificateDebug, options.warningCb);
         }
         if (terminal) {
             break;

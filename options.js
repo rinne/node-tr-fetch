@@ -26,7 +26,13 @@ const DEFAULT_OCSP_POLICY = {
     rejectedCertificate: 'reject'
 };
 
+const DEFAULT_REVOCATION_POLICY = {
+    strategy: 'both',
+    noRevocationStatus: 'ignore'
+};
+
 const CUSTOM_OPTIONS = [
+    'trFetchCertificateRevocationPolicy',
     'trFetchCrlPolicy', 'trFetchCrlDistributionPointOverride', 'trFetchCrlOverride',
     'trFetchOcspPolicy', 'trFetchOcspUriOverride', 'trFetchDebug', 'trFetchWarningCb'
 ];
@@ -87,6 +93,11 @@ function parsePolicy(value, defaults, name) {
                 throw new TypeError(`${name}.${key} must be -1 or a nonnegative safe integer (seconds)`);
             }
             policy[key] = setting ?? defaults[key];
+        } else if (key === 'strategy') {
+            if (! [ 'both', 'ocsp-first', 'crl-first' ].includes(setting)) {
+                throw new TypeError(`${name}.strategy must be both, ocsp-first or crl-first`);
+            }
+            policy.strategy = setting;
         } else if ((key === 'crlCheckDepth') || (key === 'ocspCheckDepth')) {
             policy[key] = parseDepth(setting, `${name}.${key}`);
         } else {
@@ -135,6 +146,8 @@ function splitOptions(options) {
     }
     const policy = parsePolicy(fetchOptions.trFetchCrlPolicy, DEFAULT_POLICY, 'trFetchCrlPolicy');
     const ocspPolicy = parsePolicy(fetchOptions.trFetchOcspPolicy, DEFAULT_OCSP_POLICY, 'trFetchOcspPolicy');
+    const revocationPolicy = parsePolicy(fetchOptions.trFetchCertificateRevocationPolicy, DEFAULT_REVOCATION_POLICY,
+                                         'trFetchCertificateRevocationPolicy');
     let ocspUri = fetchOptions.trFetchOcspUriOverride;
     if (ocspUri instanceof URL) {
         ocspUri = ocspUri.href;
@@ -170,7 +183,7 @@ function splitOptions(options) {
     if (fetchOptions.dispatcher !== undefined) {
         throw new TypeError('trFetch cannot safely combine CRL checking with a custom dispatcher');
     }
-    return { fetchOptions, policy, distributionPoint, crl, ocspPolicy, ocspUri, debugEnabled, warningCb };
+    return { fetchOptions, policy, distributionPoint, crl, ocspPolicy, ocspUri, revocationPolicy, debugEnabled, warningCb };
 }
 
 module.exports = { DEFAULT_MAX_CRL_BYTES, splitOptions };
