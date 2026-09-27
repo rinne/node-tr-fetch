@@ -19,6 +19,7 @@ async function trFetch(input, options) {
         crl: config.policy.disabled ? 'disabled' : 'enabled',
         crlDepth: (config.checkDepth === Infinity) ? 'full-chain' : config.checkDepth,
         maxCrlBytes: config.policy.maxCrlBytes,
+        crlCacheScope: config.policy.crlCacheScope,
         ocsp: config.ocspPolicy.disabled ? 'disabled' : 'enabled',
         ocspDepth: (config.ocspCheckDepth === Infinity) ? 'full-chain' : config.ocspCheckDepth
     });

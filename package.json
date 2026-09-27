@@ -15,6 +15,7 @@
         "cache.js",
         "check.js",
         "crl.js",
+        "crlstream.js",
         "debug.js",
         "download.js",
         "errors.js",

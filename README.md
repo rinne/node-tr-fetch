@@ -29,6 +29,7 @@ const response = await trFetch(url, {
 	trFetchCrlPolicy: {
 		disabled: false,
 		maxCrlBytes: 16777216,
+		crlCacheScope: 'crl',
 		missingCrlDistributionPoint: 'ignore',
 		unreachableCrlDistributionPoint: 'reject',
 		invalidCrl: 'reject',
@@ -78,12 +79,57 @@ await trFetch('https://example.com/', { trFetchCrlPolicy: { maxCrlBytes: 64 * 10
 ```
 
 A larger download is an unreachable distribution point; larger
-`trFetchCrlOverride` data is an invalid CRL. A cached CRL above the caller's
-limit is not used, even if an earlier caller with a higher limit cached it.
-The CRL is downloaded into a single buffer, verified and scanned in place,
-and only its serial numbers are kept. Peak memory while fetching a CRL is
-roughly three to four times its size, most of it in Node's HTTP stream
-buffering, and is released afterwards.
+`trFetchCrlOverride` data is an invalid CRL. A cached CRL or result from a CRL
+above the caller's limit is not used, even if an earlier caller with a higher
+limit cached it.
+
+With `crlCacheScope: 'crl'`, the CRL is downloaded into a single buffer,
+verified and scanned in place, and only its serial numbers are kept. Peak
+memory while fetching a CRL is roughly three to four times its size, most of
+it in Node's HTTP stream buffering, and is released afterwards. With
+`'certificate'`, the CRL is never held in memory and the limit bounds only the
+download; see [CRL cache scope](#crl-cache-scope).
+
+### CRL cache scope
+
+`trFetchCrlPolicy.crlCacheScope` selects how CRLs are processed and what the
+cache keeps. Only `'crl'` (the default) and `'certificate'` are accepted.
+
+| | `'crl'` | `'certificate'` |
+|---|---|---|
+| Processing | Downloaded, then authenticated and indexed | Checked while streaming; never held |
+| Cached | Every revoked serial of the CRL | Whether the CRL lists each checked certificate |
+| Another certificate of the same CRL | Answered from the cache | Downloads the CRL again, unless cached as a candidate (see below) |
+| Peak memory for a 43 MB CRL | about 135–165 MB | about 40–47 MB |
+| Cached memory for that CRL | 14 MB | tens of bytes per certificate |
+
+`'crl'` suits clients that talk to many servers whose certificates share a
+CRL. `'certificate'` suits clients that talk to few servers, or that meet very
+large CRLs.
+
+In `'certificate'` scope, the CRL signature is computed as the CRL arrives,
+and every revoked entry is checked as with `'crl'`. Nothing is decided until
+the whole CRL has been read and authenticated; reading stops early only at
+invalid content. A PEM CRL is collected within `maxCrlBytes` and decoded
+first. Cache entries are keyed by the issuer certificate, the checked
+certificate and the distribution URL:
+
+- An entry answers until the earlier of the CRL's `nextUpdate` and the TTL.
+  It records that the certificate is listed or not listed; both are cached.
+- After that, it is **stale**: never an answer, but a candidate. Whenever the
+  CRL is downloaded for any certificate of the same issuer and URL, all
+  candidates, fresh or stale, are checked in the same pass and refreshed. The
+  CRL's scope is checked again for each; a candidate it no longer covers is
+  dropped.
+- A result from an older CRL (by `thisUpdate`) never replaces one from a newer
+  CRL, so a stale mirror cannot roll a revocation back.
+- Stale candidates are dropped after a day without lookups. Refreshes do not
+  count as lookups, neither for staleness nor for LRU order.
+- `trFetchCrlOverride` data is checked directly and never cached.
+
+A download failure or an invalid CRL leaves other entries unchanged. The CRL
+cache and this result cache are separate, and `trFetchCrlCacheSize` and
+`trFetchCrlCacheTTL` apply to each.
 
 ### Disabling a check
 
@@ -447,7 +493,7 @@ tr-curl --cacert private-ca.pem --crlfile current.crl https://internal.example/
 | Failure and limits | `-f/--fail`, `--fail-with-body`, `--fail-early`, `--max-filesize`, `-m/--max-time` |
 | Messages | `-v/--verbose`, `-s/--silent`, `-S/--show-error`, `--no-progress-meter`, `-#/--progress-bar`, `-h/--help`, `-V/--version` |
 | TLS | `-k/--insecure`, `--cacert`, `--crlfile`, `-1/--tlsv1`, `--tlsv1.0` … `--tlsv1.3`, `--tls-max`, `--ciphers`, `--tls13-ciphers` |
-| trFetch | `--tr-fetch-max-crl-bytes`, `--tr-fetch-crl-url`, `--tr-fetch-ocsp-url`, `--tr-fetch-options` |
+| trFetch | `--tr-fetch-max-crl-bytes`, `--tr-fetch-crl-cache-scope`, `--tr-fetch-crl-url`, `--tr-fetch-ocsp-url`, `--tr-fetch-options` |
 
 `--verbose` prints the request and response headers, prefixed with `>` and
 `<` like curl, and also enables `trFetchDebug`, so the revocation diagnostics
@@ -459,15 +505,17 @@ The `--tr-fetch-*` options set trFetch options directly:
 | Option | trFetch option |
 |---|---|
 | `--tr-fetch-max-crl-bytes <bytes>` | `trFetchCrlPolicy.maxCrlBytes`, a positive integer |
+| `--tr-fetch-crl-cache-scope <crl\|certificate>` | `trFetchCrlPolicy.crlCacheScope`; tr-curl's default is `certificate` |
 | `--tr-fetch-crl-url <url>` | `trFetchCrlDistributionPointOverride` |
 | `--tr-fetch-ocsp-url <url>` | `trFetchOcspUriOverride` |
 | `--crlfile <file>` | `trFetchCrlOverride`, read from the file |
 
 `--tr-fetch-options` takes a JSON object of any trFetch options, for example
 `'{"trFetchCrlCheckDepth":"full-chain"}'`. It can be repeated; later objects
-replace earlier keys. The options above take precedence over the same
-settings in it, whatever their order, and `--tr-fetch-max-crl-bytes` is merged
-into its `trFetchCrlPolicy` rather than replacing it.
+replace earlier keys. The options above take precedence over the same settings
+in it, whatever their order, and `--tr-fetch-max-crl-bytes` and
+`--tr-fetch-crl-cache-scope` are merged into its `trFetchCrlPolicy` rather
+than replacing it.
 
 `--insecure` cannot be implemented through trFetch, which never relaxes TLS
 verification. With `-k`, tr-curl uses plain fetch with an unverified TLS

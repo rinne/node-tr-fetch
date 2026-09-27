@@ -30,7 +30,12 @@ class SerialIndex {
     }
 
     has(serial) {
-        const group = this.#groups.get(serial.length);
+        return this.hasRange(serial, 0, serial.length);
+    }
+
+    // Whether bytes[start, end) is a listed serial, without copying it.
+    hasRange(bytes, start, end) {
+        const group = this.#groups.get(end - start);
         if (! group) {
             return false;
         }
@@ -42,7 +47,7 @@ class SerialIndex {
             const base = middle * width;
             let difference = 0;
             for (let i = 0; (i < width) && ! difference; i++) {
-                difference = data[base + i] - serial[i];
+                difference = data[base + i] - bytes[start + i];
             }
             if (! difference) {
                 return true;

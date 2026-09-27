@@ -28,21 +28,41 @@ function distributionPoints(certificate) {
     });
 }
 
+function isPem(bytes) {
+    return bytes.toString('ascii', 0, 32).trimStart().startsWith('-----BEGIN');
+}
+
+// One PEM X509 CRL block, strictly: canonical base64 and only whitespace
+// around it.
+function decodePem(bytes) {
+    const match = /^\s*-----BEGIN X509 CRL-----\s*([A-Za-z0-9+/=\r\n\t ]+)\s*-----END X509 CRL-----\s*$/.exec(bytes.toString('ascii'));
+    if (! match) {
+        throw new Error('Malformed PEM CRL; expected one X509 CRL block');
+    }
+    const encoded = match[1].replace(/\s/g, '');
+    const decoded = Buffer.from(encoded, 'base64');
+    if (decoded.toString('base64') !== encoded) {
+        throw new Error('Malformed base64 in PEM CRL');
+    }
+    return decoded;
+}
+
+// PKI.js decodes a CRL whose TBS consists of the given fields, followed by
+// the trailer (signature algorithm and value): everything but the entries.
+function buildCrlStub(fields, trailer) {
+    const length = fields.reduce((sum, x) => sum + x.length, 0);
+    const tbsHeader = derHeader(0x30, length);
+    return parseDer(Buffer.concat([ derHeader(0x30, tbsHeader.length + length + trailer.length), tbsHeader, ...fields, trailer ]),
+                    pki.CertificateRevocationList);
+}
+
 function parseCrl(bytes, maxBytes = DEFAULT_MAX_CRL_BYTES) {
     if (bytes.length > maxBytes) {
         throw new Error(`CRL exceeds maxCrlBytes (${maxBytes} bytes)`);
     }
     const size = bytes.length;
-    if (bytes.toString('ascii', 0, 32).trimStart().startsWith('-----BEGIN')) {
-        const match = /^\s*-----BEGIN X509 CRL-----\s*([A-Za-z0-9+/=\r\n\t ]+)\s*-----END X509 CRL-----\s*$/.exec(bytes.toString('ascii'));
-        if (! match) {
-            throw new Error('Malformed PEM CRL; expected one X509 CRL block');
-        }
-        const encoded = match[1].replace(/\s/g, '');
-        bytes = Buffer.from(encoded, 'base64');
-        if (bytes.toString('base64') !== encoded) {
-            throw new Error('Malformed base64 in PEM CRL');
-        }
+    if (isPem(bytes)) {
+        bytes = decodePem(bytes);
     }
     const outer = derElement(bytes, 0);
     if (outer.end !== bytes.length) {
@@ -63,12 +83,8 @@ function parseCrl(bytes, maxBytes = DEFAULT_MAX_CRL_BYTES) {
     // Decoding every revoked entry into an ASN.1 object tree takes hundreds of
     // bytes of memory per encoded byte, so large CRLs could exhaust the heap.
     // PKI.js decodes the rest; the entries are scanned in place.
-    const headerFields = fields.filter(x => x !== entries).map(x => bytes.subarray(x.offset, x.end));
-    const headerLength = headerFields.reduce((sum, x) => sum + x.length, 0);
-    const trailer = bytes.subarray(tbs.end, outer.end);
-    const tbsHeader = derHeader(0x30, headerLength);
-    const crl = parseDer(Buffer.concat([ derHeader(0x30, tbsHeader.length + headerLength + trailer.length),
-        tbsHeader, ...headerFields, trailer ]), pki.CertificateRevocationList);
+    const crl = buildCrlStub(fields.filter(x => x !== entries).map(x => bytes.subarray(x.offset, x.end)),
+                             bytes.subarray(tbs.end, outer.end));
     const scan = scanEntries(bytes, entries);
     return { crl, size, bytes, tbs: bytes.subarray(tbs.offset, tbs.end), entries,
         revokedCount: scan.count, entryProblem: scan.problem };
@@ -158,31 +174,41 @@ function scanEntries(bytes, entries, visit) {
     let count = 0;
     let problem;
     for (let offset = entries?.start; offset < entries?.end;) {
-        const entry = derRead(bytes, offset, entries.end, s.entry);
-        offset = entry.end;
-        const number = derRead(bytes, entry.start, entry.end, s.number);
-        const date = derRead(bytes, number.end, entry.end, s.date);
-        let next = date.end;
-        if ((entry.tag !== 0x30) || (number.tag !== 0x02) || ((date.tag !== 0x17) && (date.tag !== 0x18))) {
-            throw new Error('Malformed revoked certificate entry');
-        }
-        if (next < entry.end) {
-            const extensions = derRead(bytes, next, entry.end, s.extensions);
-            if (extensions.tag !== 0x30) {
-                throw new Error('Malformed revoked certificate entry');
-            }
-            if (visit === undefined) {
-                problem ??= checkEntryExtensions(bytes, extensions, s);
-            }
-            next = extensions.end;
-        }
-        if (next !== entry.end) {
-            throw new Error('Malformed revoked certificate entry');
-        }
+        const result = readEntry(bytes, offset, entries.end, s, visit === undefined);
+        problem ??= result.problem;
+        offset = s.entry.end;
         count++;
-        visit?.(number.start, number.end);
+        visit?.(s.number.start, s.number.end);
     }
     return { count, problem };
+}
+
+// Check one revoked entry at bytes[offset], within end. Fills s.entry and
+// s.number (the serial); structural errors throw, and with checkExtensions,
+// the first unsupported extension is returned as problem.
+function readEntry(bytes, offset, end, s, checkExtensions) {
+    const entry = derRead(bytes, offset, end, s.entry);
+    const number = derRead(bytes, entry.start, entry.end, s.number);
+    const date = derRead(bytes, number.end, entry.end, s.date);
+    let next = date.end;
+    let problem;
+    if ((entry.tag !== 0x30) || (number.tag !== 0x02) || ((date.tag !== 0x17) && (date.tag !== 0x18))) {
+        throw new Error('Malformed revoked certificate entry');
+    }
+    if (next < entry.end) {
+        const extensions = derRead(bytes, next, entry.end, s.extensions);
+        if (extensions.tag !== 0x30) {
+            throw new Error('Malformed revoked certificate entry');
+        }
+        if (checkExtensions) {
+            problem = checkEntryExtensions(bytes, extensions, s);
+        }
+        next = extensions.end;
+    }
+    if (next !== entry.end) {
+        throw new Error('Malformed revoked certificate entry');
+    }
+    return { problem };
 }
 
 const RSA_PSS = '1.2.840.113549.1.1.10';
@@ -199,19 +225,14 @@ const SIGNATURE_KEY_TYPES = {
     '1.2.840.10045.4.3.4': [ 'ec' ]
 };
 
-// Node's synchronous verify hashes the TBS bytes where they are. Web Crypto
-// and asynchronous verification copy them first, which for a CRL of tens of
-// megabytes doubles its memory. X.509 ECDSA signatures are already DER, the
-// form Node expects.
-function crlSignatureValid(tbs, crl, issuerDer, hash) {
+// The issuer key, with RSA-PSS padding when needed, for verifying the CRL
+// signature; undefined when the algorithm does not suit the issuer key or the
+// signature value is malformed.
+function signatureOptions(crl, issuerDer) {
     const algorithm = crl.signatureAlgorithm.algorithmId;
     const key = new X509Certificate(issuerDer).publicKey;
-    if (! SIGNATURE_KEY_TYPES[algorithm]?.includes(key.asymmetricKeyType)) {
-        return false;
-    }
-    const signature = crl.signatureValue.valueBlock;
-    if (signature.unusedBits) {
-        return false;
+    if (! SIGNATURE_KEY_TYPES[algorithm]?.includes(key.asymmetricKeyType) || crl.signatureValue.valueBlock.unusedBits) {
+        return undefined;
     }
     let options = key;
     if (algorithm === RSA_PSS) {
@@ -224,8 +245,21 @@ function crlSignatureValid(tbs, crl, issuerDer, hash) {
         }
         options = { key, padding: constants.RSA_PKCS1_PSS_PADDING, saltLength: params.saltLength };
     }
+    return options;
+}
+
+function nodeHash(hash) {
+    return hash.replace('-', '').toLowerCase();
+}
+
+// Node's synchronous verify hashes the TBS bytes where they are. Web Crypto
+// and asynchronous verification copy them first, which for a CRL of tens of
+// megabytes doubles its memory. X.509 ECDSA signatures are already DER, the
+// form Node expects.
+function crlSignatureValid(tbs, crl, issuerDer, hash) {
+    const options = signatureOptions(crl, issuerDer);
     try {
-        return verify(hash.replace('-', '').toLowerCase(), tbs, options, signature.valueHexView);
+        return (options !== undefined) && verify(nodeHash(hash), tbs, options, crl.signatureValue.valueBlock.valueHexView);
     } catch (_) {
         return false;
     }
@@ -267,11 +301,10 @@ class RevocationList {
     }
 }
 
-// Everything that depends only on the CRL and its issuer: structure, scope
-// support, issuer binding, signing permission, algorithms and the signature.
-// Runs once per downloaded CRL; the result can be cached for the issuer.
-async function authenticateCrl(parsed, issuer) {
-    const crl = parsed.crl;
+// Checks of a CRL's header (everything but the entries and the signature)
+// against its issuer: structure, scope support, issuer binding, signing
+// permission and algorithms. Returns what checking certificates needs.
+async function checkCrlHeader(crl, issuer) {
     const thisUpdate = crl.thisUpdate.value.getTime();
     const nextUpdate = crl.nextUpdate?.value.getTime();
     if (! Number.isFinite(thisUpdate) || ! Number.isFinite(nextUpdate) || (nextUpdate <= thisUpdate)) {
@@ -342,6 +375,15 @@ async function authenticateCrl(parsed, issuer) {
     if (crlNumber && ! (extensionValue(crlNumber) instanceof asn1.Integer)) {
         throw new Error('Malformed CRL number');
     }
+    return { issuer: crl.issuer, thisUpdate, nextUpdate, scope: Object.freeze(scope), hash };
+}
+
+// Everything that depends only on the CRL and its issuer: the header checks,
+// the signature and the entries. Runs once per downloaded CRL; the result
+// can be cached for the issuer.
+async function authenticateCrl(parsed, issuer) {
+    const crl = parsed.crl;
+    const { thisUpdate, nextUpdate, scope, hash } = await checkCrlHeader(crl, issuer);
     // The signature covers the original TBS bytes, including the entries.
     const issuerDer = certificateDer(issuer);
     if (! crlSignatureValid(parsed.tbs, crl, issuerDer, hash)) {
@@ -353,30 +395,45 @@ async function authenticateCrl(parsed, issuer) {
     // Only an authenticated CRL is worth indexing.
     const serials = buildSerialIndex(parsed.bytes, visit => scanEntries(parsed.bytes, parsed.entries, visit));
     return new RevocationList({ issuerCertificate: issuerDer, issuer: crl.issuer, thisUpdate, nextUpdate,
-                                scope: Object.freeze(scope), serials, revokedCount: parsed.revokedCount, size: parsed.size });
+                                scope, serials, revokedCount: parsed.revokedCount, size: parsed.size });
 }
 
-// Everything that depends on the checked certificate or the current time.
-// Runs on every use, including for cached lists.
-async function checkRevocationList(list, certificate, issuer, urls, now = Date.now()) {
-    if (! list.signedBy(issuer)) {
-        throw new Error('CRL was authenticated for a different issuer certificate');
-    }
-    checkDates(list.thisUpdate, list.nextUpdate, now);
+function isCaCertificate(certificate) {
     const basic = extensionsById(certificate.extensions).get('2.5.29.19');
-    const isCA = basic ? extensionValue(basic, pki.BasicConstraints).cA : false;
-    if ((list.scope.onlyUserCertificates && isCA) || (list.scope.onlyCaCertificates && ! isCA)) {
+    return basic ? !! extensionValue(basic, pki.BasicConstraints).cA : false;
+}
+
+// Whether a CRL's scope covers a certificate of the given type, reached
+// through the given distribution point URLs. Throws if not.
+function checkScope(scope, isCA, urls) {
+    if ((scope.onlyUserCertificates && isCA) || (scope.onlyCaCertificates && ! isCA)) {
         throw new Error('CRL scope does not cover this certificate type');
     }
-    if ((list.scope.distributionPoints !== undefined) && ! list.scope.distributionPoints.some(x => urls.includes(x))) {
+    if ((scope.distributionPoints !== undefined) && ! scope.distributionPoints.some(x => urls.includes(x))) {
         throw new Error('CRL issuing distribution point does not match the effective distribution point');
     }
-    if (! list.issuer.isEqual(certificate.issuer)) {
+}
+
+// Everything that depends on the checked certificate or the current time,
+// given an authenticated CRL's header details. Throws if the CRL does not
+// apply to the certificate.
+async function checkCertificateAgainst(details, certificate, issuer, urls, now = Date.now()) {
+    checkDates(details.thisUpdate, details.nextUpdate, now);
+    checkScope(details.scope, isCaCertificate(certificate), urls);
+    if (! details.issuer.isEqual(certificate.issuer)) {
         throw new Error('CRL issuer does not match the certificate issuer');
     }
     if (! await certificate.verify(issuer, cryptoEngine)) {
         throw new Error('CRL signing certificate did not issue the checked certificate');
     }
+}
+
+// Runs on every use of a revocation list, including cached lists.
+async function checkRevocationList(list, certificate, issuer, urls, now = Date.now()) {
+    if (! list.signedBy(issuer)) {
+        throw new Error('CRL was authenticated for a different issuer certificate');
+    }
+    await checkCertificateAgainst(list, certificate, issuer, urls, now);
     const revoked = list.serials.has(Buffer.from(certificate.serialNumber.valueBlock.valueHexView));
     // Checks above can take time; the list must still be valid now.
     checkDates(list.thisUpdate, list.nextUpdate, Date.now());
@@ -388,4 +445,5 @@ async function validateCrl(parsed, certificate, issuer, urls, now = Date.now()) 
 }
 
 module.exports = { RevocationList, parseCertificate, distributionPoints, parseCrl, authenticateCrl, checkRevocationList,
-    validateCrl };
+    validateCrl, isPem, decodePem, buildCrlStub, readEntry, scratch, checkCrlHeader, signatureOptions, nodeHash, certificateDer,
+    isCaCertificate, checkScope, checkDates, checkCertificateAgainst };

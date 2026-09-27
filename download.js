@@ -25,13 +25,21 @@ function networkUrl(value, kind = 'CRL distribution point') {
 // uncompressed body's Content-Length sizes the buffer up front and lets an
 // oversized download fail before it is read; otherwise the buffer grows.
 // Only the bytes received are ever exposed.
-async function readBody(response, maxBytes, tooLarge) {
+// The uncompressed body size the server declares, if any. A declared size
+// above the limit fails before any of the body is read.
+async function declaredLength(response, maxBytes, tooLarge) {
     const declared = response.headers.has('content-encoding') ? NaN : Number(response.headers.get('content-length') ?? NaN);
     const known = Number.isSafeInteger(declared) && (declared >= 0);
     if (known && (declared > maxBytes)) {
         await response.body?.cancel();
         throw new Error(tooLarge);
     }
+    return known ? declared : undefined;
+}
+
+async function readBody(response, maxBytes, tooLarge) {
+    const declared = await declaredLength(response, maxBytes, tooLarge);
+    const known = declared !== undefined;
     let buffer = Buffer.allocUnsafeSlow(known ? declared : Math.min(64 * 1024, maxBytes));
     let length = 0;
     for await (const chunk of response.body ?? []) {
@@ -49,7 +57,7 @@ async function readBody(response, maxBytes, tooLarge) {
     return (length === buffer.length) ? buffer : buffer.subarray(0, length);
 }
 
-async function download(value, signal, body, debug, maxCrlBytes) {
+async function download(value, signal, body, debug, maxCrlBytes, consume) {
     const kind = (body === undefined) ? 'CRL' : 'OCSP';
     const maxBytes = (body === undefined) ? maxCrlBytes : 1024 * 1024;
     let url = networkUrl(value, kind);
@@ -99,6 +107,13 @@ async function download(value, signal, body, debug, maxCrlBytes) {
             }
             const tooLarge = (body === undefined) ? `CRL download exceeds maxCrlBytes (${maxBytes} bytes)` :
                 'OCSP download exceeds the 1 MiB size limit';
+            if (consume) {
+                // The consumer reads the body itself, within the same limits.
+                await declaredLength(response, maxBytes, tooLarge);
+                const result = await consume(response.body ?? [], downloadSignal);
+                debug?.('CRL streamed', { source: debugUrl(url), bytes: result.size });
+                return result;
+            }
             const result = await readBody(response, maxBytes, tooLarge);
             debug?.((kind === 'CRL') ? 'CRL fetched' : 'OCSP response fetched', { source: debugUrl(url), bytes: result.length });
             return result;
@@ -109,8 +124,10 @@ async function download(value, signal, body, debug, maxCrlBytes) {
     }
 }
 
-function downloadCrl(value, signal, debug, maxBytes) {
-    return download(value, signal, undefined, debug, maxBytes);
+// With consume, the CRL is not collected: consume(chunks, signal) reads the
+// body as it arrives and returns the result, which must report its size.
+function downloadCrl(value, signal, debug, maxBytes, consume) {
+    return download(value, signal, undefined, debug, maxBytes, consume);
 }
 
 function downloadOcsp(value, request, signal, debug) {

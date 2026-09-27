@@ -351,6 +351,33 @@ test('--tr-fetch-* options set the CRL size limit and CRL/OCSP locations, overri
     }
 });
 
+test('--tr-fetch-crl-cache-scope selects the CRL cache scope; tr-curl defaults to certificate', async function() {
+    assert.match((await curl([ '--help' ])).stdout, /--tr-fetch-crl-cache-scope <crl\|certificate>/);
+    const scope = async args => {
+        const result = await curl([ '-s', '-v', '--cacert', caFile, '-o', path.join(tmp, 'scope'), ...args, secureUrl ]);
+        assert.equal(result.code, 0, args.join(' '));
+        return [ result.stderr.match(/"crlCacheScope":"(\w+)"/)[1],
+            /CRL authenticated while streaming/.test(result.stderr) ? 'streamed' : 'indexed' ];
+    };
+    assert.deepEqual(await scope([]), [ 'certificate', 'streamed' ]);
+    assert.deepEqual(await scope([ '--tr-fetch-crl-cache-scope', 'crl' ]), [ 'crl', 'indexed' ]);
+    assert.deepEqual(await scope([ '--tr-fetch-options', '{"trFetchCrlPolicy":{"crlCacheScope":"crl"}}' ]), [ 'crl', 'indexed' ]);
+    assert.deepEqual(await scope([ '--tr-fetch-crl-cache-scope=certificate', '--tr-fetch-options', '{"trFetchCrlPolicy":{"crlCacheScope":"crl"}}' ]),
+        [ 'certificate', 'streamed' ]);
+    // The size limit and the scope merge into one policy.
+    const merged = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-crl-cache-scope', 'crl', '--tr-fetch-max-crl-bytes', '10', secureUrl ]);
+    assert.equal(merged.code, 60);
+    assert.match(merged.stderr, /exceeds maxCrlBytes \(10 bytes\)/);
+    for (const scope of [ 'certificate', 'crl' ]) {
+        const revoked = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-crl-cache-scope', scope, revokedUrl ]);
+        assert.equal(revoked.code, 60, scope);
+        assert.match(revoked.stderr, /Revoked server certificate/, scope);
+    }
+    for (const value of [ 'CRL', 'all', '' ]) {
+        assert.equal((await curl([ '-s', '--tr-fetch-crl-cache-scope', value, secureUrl ])).code, 2, value);
+    }
+});
+
 test('--insecure bypasses TLS verification and revocation checks', async function() {
     assert.equal((await curl([ '-s', untrustedUrl ])).code, 60);
     let result = await curl([ '-s', '-k', untrustedUrl ]);

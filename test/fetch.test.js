@@ -7,6 +7,7 @@ const https = require('node:https');
 const tls = require('node:tls');
 const { once } = require('node:events');
 const fetch = require('..');
+const pki = require('pkijs');
 const fixtures = require('./fixtures');
 
 const testDebug = /^(y|yes|true|1)$/i.test(process.env.TR_FETCH_TEST_DEBUG ?? '');
@@ -338,6 +339,115 @@ test('a cached revocation list answers for other certificates of the same issuer
     await (await trFetch(good.url, { trFetchOcspPolicy: { disabled: true } })).text();
     assert.equal(count(), 1);
     assert.equal(good.hits(), 2);
+});
+
+const byCertificate = (options = {}) => ({ ...options, trFetchCrlPolicy: { crlCacheScope: 'certificate', ...options.trFetchCrlPolicy },
+                                           trFetchOcspPolicy: { disabled: true } });
+
+test('certificate scope streams the CRL, caches a result per certificate and classifies failures', async function(t) {
+    routes.set('/cs-basic', revokedCrl.der);
+    const count = () => crlRequests.filter(x => x.url === '/cs-basic').length;
+    const revoked = await endpoint(t, { urls: [ crlBase + '/cs-basic' ] });
+    const good = await endpoint(t, { urls: [ crlBase + '/cs-basic' ], serial: 41 });
+    const events = captureDebug(t);
+    await assert.rejects(trFetch(revoked.url, byCertificate({ trFetchDebug: true })), crlError('TR_FETCH_CERTIFICATE_REVOKED', /Revoked/));
+    assert.equal(revoked.hits(), 0);
+    assert.ok(events.some(x => (x.event === 'Verification configured') && (x.crlCacheScope === 'certificate')));
+    assert.ok(events.some(x => (x.event === 'CRL authenticated while streaming') && (x.revokedEntries === 1)));
+    assert.ok(! events.some(x => [ 'CRL fetched', 'CRL parsed', 'CRL authenticated and indexed' ].includes(x.event)));
+    t.mock.restoreAll();
+    assert.equal(count(), 1);
+    // The revoked result is cached too.
+    await assert.rejects(trFetch(revoked.url, byCertificate()), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
+    assert.equal(count(), 1);
+    // Another certificate is a separate entry, checked in its own download,
+    // which also refreshes the first one.
+    await (await trFetch(good.url, byCertificate())).text();
+    assert.equal(count(), 2);
+    await (await trFetch(good.url, byCertificate())).text();
+    assert.equal(count(), 2);
+    assert.equal(good.hits(), 2);
+    // PEM CRLs stream as well.
+    const pem = await endpoint(t, { urls: [ crlBase + '/revoked' ] });
+    await assert.rejects(trFetch(pem.url, byCertificate()), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
+    // Content errors are invalid CRLs; transfer errors are unreachable.
+    routes.set('/cs-garbage', Buffer.from('garbage that is not a CRL at all'));
+    const tampered = Buffer.from(goodCrl.der);
+    tampered[tampered.length - 5] ^= 1;
+    routes.set('/cs-tampered', tampered);
+    for (const [path, code, message] of [
+        [ '/cs-garbage', 'TR_FETCH_CRL_INVALID', /Invalid CRL/ ],
+        [ '/cs-tampered', 'TR_FETCH_CRL_INVALID', /signature verification failed/ ],
+        [ '/cs-missing', 'TR_FETCH_CRL_UNREACHABLE_DISTRIBUTION_POINT', /HTTP 404/ ]
+    ]) {
+        const server = await endpoint(t, { urls: [ crlBase + path ] });
+        await assert.rejects(trFetch(server.url, byCertificate()), crlError(code, message), path);
+        assert.equal(server.hits(), 0);
+    }
+    const limited = await endpoint(t, { urls: [ crlBase + '/cs-basic' ], serial: 44 });
+    await assert.rejects(trFetch(limited.url, byCertificate({ trFetchCrlPolicy: { maxCrlBytes: 50 } })), error =>
+        (error.code === 'TR_FETCH_CRL_UNREACHABLE_DISTRIBUTION_POINT') && /exceeds maxCrlBytes \(50 bytes\)/.test(error.message));
+    // Override data is checked directly, bypassing the cached result.
+    await assert.rejects(trFetch(revoked.url, byCertificate({ trFetchCrlOverride: revokedCrl.der })), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
+    await (await trFetch(revoked.url, byCertificate({ trFetchCrlOverride: goodCrl.der }))).text();
+    assert.equal(revoked.hits(), 1);
+    // The size-limited check above made one request; the overrides none.
+    assert.equal(count(), 3);
+});
+
+test('certificate scope: one download refreshes all cached certificates of the same CRL, including stale ones', async function(t) {
+    routes.set('/cs-refresh', goodCrl.der);
+    const count = () => crlRequests.filter(x => x.url === '/cs-refresh').length;
+    const [a, b, c] = await Promise.all([ 51, 52, 53 ].map(serial => endpoint(t, { urls: [ crlBase + '/cs-refresh' ], serial })));
+    await (await trFetch(a.url, byCertificate())).text();
+    assert.equal(count(), 1);
+    // A newer CRL revokes a; checking b downloads it and refreshes a.
+    routes.set('/cs-refresh', (await fixtures.crl(ca, { serials: [ 51 ], start: Date.now() })).der);
+    const events = captureDebug(t);
+    await (await trFetch(b.url, byCertificate({ trFetchDebug: true }))).text();
+    assert.equal(count(), 2);
+    assert.ok(events.some(x => (x.event === 'CRL authenticated while streaming') && (x.serialsChecked === 2)));
+    assert.ok(events.some(x => (x.event === 'CRL result cache refreshed') && (x.listed === true)));
+    t.mock.restoreAll();
+    await assert.rejects(trFetch(a.url, byCertificate()), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
+    assert.equal(count(), 2);
+    assert.equal(a.hits(), 1);
+    // Once stale, entries still name the certificates to check: after c's
+    // download, which revokes b, b is answered without a download of its own.
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    routes.set('/cs-refresh', (await fixtures.crl(ca, { serials: [ 51, 52 ], start: Date.now() })).der);
+    await (await trFetch(c.url, byCertificate({ trFetchCrlCacheTTL: 1 }))).text();
+    assert.equal(count(), 3);
+    await assert.rejects(trFetch(b.url, byCertificate({ trFetchCrlCacheTTL: 1 })), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
+    await assert.rejects(trFetch(a.url, byCertificate({ trFetchCrlCacheTTL: 1 })), { code: 'TR_FETCH_CERTIFICATE_REVOKED' });
+    assert.equal(count(), 3);
+});
+
+test('certificate scope: an older CRL never replaces a newer result, and a changed scope drops candidates', async function(t) {
+    const newer = await fixtures.crl(ca, { start: Date.now() - 1000 });
+    const older = await fixtures.crl(ca, { serials: [ 61 ], start: Date.now() - 120000 });
+    routes.set('/cs-order', newer.der);
+    const count = () => crlRequests.filter(x => x.url === '/cs-order').length;
+    const [a, b] = await Promise.all([ 61, 62 ].map(serial => endpoint(t, { urls: [ crlBase + '/cs-order' ], serial })));
+    await (await trFetch(a.url, byCertificate())).text();
+    // A stale mirror serves an older CRL that lists a: b is checked against
+    // it, but a keeps its result from the newer CRL.
+    routes.set('/cs-order', older.der);
+    const events = captureDebug(t);
+    await (await trFetch(b.url, byCertificate({ trFetchDebug: true }))).text();
+    assert.ok(events.some(x => (x.event === 'CRL result cache store skipped') && /newer CRL/.test(x.reason)));
+    t.mock.restoreAll();
+    await (await trFetch(a.url, byCertificate())).text();
+    assert.equal(count(), 2);
+    // A newer CRL that covers only CA certificates: b fails, and a is no
+    // longer a candidate.
+    const caOnly = fixtures.extension('2.5.29.28', new pki.IssuingDistributionPoint({ onlyContainsCACerts: true }).toSchema(), true);
+    routes.set('/cs-order', (await fixtures.crl(ca, { extensions: [ caOnly ], start: Date.now() })).der);
+    const c = await endpoint(t, { urls: [ crlBase + '/cs-order' ], serial: 63 });
+    const dropped = captureDebug(t);
+    await assert.rejects(trFetch(c.url, byCertificate({ trFetchDebug: true })), error =>
+        (error.code === 'TR_FETCH_CRL_INVALID') && /scope does not cover/.test(error.message));
+    assert.equal(dropped.filter(x => (x.event === 'CRL result cache candidate dropped') && /scope/.test(x.reason)).length, 2);
 });
 
 test('CRL cache is shared, TTL zero and nonpositive sizes bypass it', async function(t) {

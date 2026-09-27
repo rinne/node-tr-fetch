@@ -105,6 +105,8 @@ function optionDefinitions() {
         arg(undefined, 'tls-max', '<version> Maximum TLS version: 1.0, 1.1, 1.2, 1.3 or default', tlsMaxCb),
         arg(undefined, 'tls13-ciphers', '<list> TLS 1.3 cipher suites to use'),
         arg(undefined, 'tr-fetch-max-crl-bytes', '<bytes> Largest CRL accepted (default 16777216)', positiveBytesCb),
+        arg(undefined, 'tr-fetch-crl-cache-scope', '<crl|certificate> Cache whole CRLs or results per certificate (default certificate)',
+            value => [ 'crl', 'certificate' ].includes(value) ? value : undefined),
         arg(undefined, 'tr-fetch-crl-url', '<url> Fetch the server certificate\'s CRL from this URL instead', networkUrlCb),
         arg(undefined, 'tr-fetch-ocsp-url', '<url> Query this OCSP responder for the server certificate instead', networkUrlCb),
         arg(undefined, 'tr-fetch-options', '<json> Extra trFetch options as a JSON object', jsonObjectCb, true),
@@ -142,12 +144,16 @@ function parseArguments(argv) {
     }
     // Dedicated options take precedence over the same settings given in
     // --tr-fetch-options, regardless of their order.
-    if (value('tr-fetch-max-crl-bytes') !== undefined) {
-        const policy = trFetchOptions.trFetchCrlPolicy;
-        // Leave a malformed policy for trFetch to reject.
-        if ((policy === undefined) || (policy && (typeof(policy) === 'object') && ! Array.isArray(policy))) {
-            trFetchOptions.trFetchCrlPolicy = { ...policy, maxCrlBytes: value('tr-fetch-max-crl-bytes') };
+    const policy = trFetchOptions.trFetchCrlPolicy;
+    // Leave a malformed policy for trFetch to reject.
+    if ((policy === undefined) || (policy && (typeof(policy) === 'object') && ! Array.isArray(policy))) {
+        const merged = { ...policy };
+        if (value('tr-fetch-max-crl-bytes') !== undefined) {
+            merged.maxCrlBytes = value('tr-fetch-max-crl-bytes');
         }
+        // tr-curl streams CRLs by default: its cache lasts one run anyway.
+        merged.crlCacheScope = value('tr-fetch-crl-cache-scope') ?? merged.crlCacheScope ?? 'certificate';
+        trFetchOptions.trFetchCrlPolicy = merged;
     }
     if (value('tr-fetch-crl-url') !== undefined) {
         if (value('crlfile') !== undefined) {

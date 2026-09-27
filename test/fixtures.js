@@ -153,4 +153,4 @@ async function bulkCrl(issuer, count, { serials = [], entry } = {}) {
     return der(0x30, body, Buffer.from(small.signatureAlgorithm.toSchema().toBER()), der(0x03, Buffer.from([ 0 ]), signature));
 }
 
-module.exports = { certificate, crl, bulkCrl, ocsp, extension };
+module.exports = { certificate, crl, bulkCrl, ocsp, extension, der };

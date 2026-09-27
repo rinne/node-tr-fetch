@@ -1,14 +1,18 @@
 'use strict';
 
 const { createHash } = require('node:crypto');
-const { parseCertificate, distributionPoints, parseCrl, authenticateCrl, checkRevocationList } = require('./crl');
+const { parseCertificate, distributionPoints, parseCrl, authenticateCrl, checkRevocationList, checkCertificateAgainst,
+    checkDates, checkScope, isCaCertificate } = require('./crl');
+const { authenticateCrlStream } = require('./crlstream');
 const { networkUrl, downloadCrl } = require('./download');
 const { TrFetchCrlError, TrFetchOcspError, applyPolicy } = require('./errors');
 const { checkOcspCertificate } = require('./ocsp');
 const CrlCache = require('./cache');
+const { CrlResultCache } = require('./cache');
 const { debugUrl } = require('./debug');
 
 const cache = new CrlCache();
+const resultCache = new CrlResultCache();
 
 function sourceLabel(value) {
     try {
@@ -66,6 +70,139 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
         return;
     }
     const issuerId = createHash('sha256').update(peer.issuerCertificate.raw).digest('hex');
+    const certificateId = createHash('sha256').update(peer.raw).digest('hex');
+    const limits = [ options.cacheSize, options.cacheTTL ];
+    function unreachable(source, cause) {
+        failures.push(issue('unreachableCrlDistributionPoint',
+                            `Unreachable CRL distribution point ${sourceLabel(source)}: ${cause.message}`, cause, source));
+    }
+    function invalid(source, cause) {
+        failures.push(issue('invalidCrl',
+                            `Invalid CRL from ${(source === undefined) ? 'trFetchCrlOverride' : sourceLabel(source)}: ${cause.message}`, cause, source));
+    }
+
+    // crlCacheScope 'crl': the whole CRL is downloaded, authenticated and
+    // indexed, and the index is cached for all certificates of the issuer.
+    async function checkByCrl(source, point) {
+        let list, key, bytes;
+        const fetchedAt = Date.now();
+        if (forcedCrl !== undefined) {
+            bytes = forcedCrl;
+        } else {
+            try {
+                const url = networkUrl(source);
+                key = issuerId + ':' + url.href;
+                list = cache.get(key, ...limits, Date.now(), debug);
+                // A CRL cached under a higher limit must not bypass this one.
+                if (list && (list.size > options.policy.maxCrlBytes)) {
+                    debug?.('CRL cache entry not used', { source: debugUrl(url), reason: 'exceeds maxCrlBytes',
+                                                          bytes: list.size, maxCrlBytes: options.policy.maxCrlBytes });
+                    list = undefined;
+                }
+                if (! list) {
+                    bytes = await downloadCrl(url, signal, debug, options.policy.maxCrlBytes);
+                }
+            } catch (cause) {
+                signal?.throwIfAborted();
+                unreachable(source, cause);
+                return undefined;
+            }
+        }
+        let result;
+        try {
+            if (! list) {
+                const label = (source === undefined) ? 'trFetchCrlOverride' : debugUrl(source);
+                const parsed = parseCrl(bytes, options.policy.maxCrlBytes);
+                debug?.('CRL parsed', { source: label, revokedEntries: parsed.revokedCount });
+                list = await authenticateCrl(parsed, issuer);
+                debug?.('CRL authenticated and indexed', { source: label, serials: list.serials.count,
+                                                           indexBytes: list.serials.bytes });
+            }
+            result = await checkRevocationList(list, certificate, issuer, point.urls);
+        } catch (cause) {
+            invalid(source, cause);
+            return undefined;
+        }
+        if ((key !== undefined) && (bytes !== undefined)) {
+            cache.set(key, list, result.nextUpdate, fetchedAt, ...limits, Date.now(), debug);
+        }
+        return result;
+    }
+
+    // crlCacheScope 'certificate': the CRL is streamed and never held; only
+    // whether it lists this certificate is cached. Cached certificates of the
+    // same issuer and CRL URL are checked in the same pass and refreshed.
+    async function checkByCertificate(source, point) {
+        const fetchedAt = Date.now();
+        let url;
+        try {
+            url = networkUrl(source);
+        } catch (cause) {
+            unreachable(source, cause);
+            return undefined;
+        }
+        const group = issuerId + ':' + url.href;
+        const key = issuerId + ':' + certificateId + ':' + url.href;
+        const cached = resultCache.lookup(key, ...limits, options.policy.maxCrlBytes, Date.now(), debug);
+        if (cached) {
+            return { revoked: cached.listed, nextUpdate: cached.nextUpdate };
+        }
+        const serial = Buffer.from(certificate.serialNumber.valueBlock.valueHexView);
+        const candidates = resultCache.candidates(group, key, ...limits);
+        const serials = [ serial, ...candidates.map(([, entry]) => entry.serial) ];
+        let streamed;
+        try {
+            streamed = await downloadCrl(url, signal, debug, options.policy.maxCrlBytes,
+                                         chunks => authenticateCrlStream(chunks, issuer, options.policy.maxCrlBytes, serials));
+        } catch (cause) {
+            signal?.throwIfAborted();
+            if (cause.invalidCrl) {
+                invalid(source, cause);
+            } else {
+                unreachable(source, cause);
+            }
+            return undefined;
+        }
+        const { details, listed } = streamed;
+        const isListed = bytes => listed.has(bytes.toString('latin1'));
+        debug?.('CRL authenticated while streaming', { source: debugUrl(url), revokedEntries: streamed.revokedCount,
+                                                       serialsChecked: serials.length, bytes: streamed.size });
+        const common = { thisUpdate: details.thisUpdate, nextUpdate: details.nextUpdate, fetchedAt, size: streamed.size };
+        // Refresh the other certificates from the same authenticated CRL,
+        // unless it is not currently valid. Their issuer and issuance were
+        // checked when first stored; the CRL's scope is checked again.
+        let current = true;
+        try {
+            checkDates(details.thisUpdate, details.nextUpdate, Date.now());
+        } catch (_) {
+            current = false;
+        }
+        for (const [otherKey, entry] of current ? candidates : []) {
+            try {
+                checkScope(details.scope, entry.isCA, entry.urls);
+            } catch (cause) {
+                resultCache.remove(otherKey, debug, cause.message);
+                continue;
+            }
+            const { expiresAt, lastUsedAt, ...facts } = entry;
+            void expiresAt;
+            void lastUsedAt;
+            resultCache.store(otherKey, { ...facts, ...common, listed: isListed(entry.serial) }, ...limits, Date.now(), debug, false);
+        }
+        let result;
+        try {
+            await checkCertificateAgainst(details, certificate, issuer, point.urls);
+            result = { revoked: isListed(serial), nextUpdate: details.nextUpdate };
+            checkDates(details.thisUpdate, details.nextUpdate, Date.now());
+        } catch (cause) {
+            invalid(source, cause);
+            return undefined;
+        }
+        resultCache.store(key, { issuerId, certificateId, url: url.href, group, serial, isCA: isCaCertificate(certificate),
+                                 urls: [ ...point.urls ], listed: result.revoked, ...common }, ...limits, Date.now(), debug, true);
+        return result;
+    }
+
     const failures = [];
     let attempts = 0;
     for (const point of points) {
@@ -83,49 +220,10 @@ async function checkCertificate(peer, hostname, options, signal, override, debug
                 failures.push(issue('unreachableCrlDistributionPoint', 'CRL distribution point lookup limit (32) exceeded'));
                 break;
             }
-            let list, key, bytes;
-            const fetchedAt = Date.now();
-            if (forcedCrl !== undefined) {
-                bytes = forcedCrl;
-            } else {
-                try {
-                    const url = networkUrl(source);
-                    key = issuerId + ':' + url.href;
-                    list = cache.get(key, options.cacheSize, options.cacheTTL, Date.now(), debug);
-                    // A CRL cached under a higher limit must not bypass this one.
-                    if (list && (list.size > options.policy.maxCrlBytes)) {
-                        debug?.('CRL cache entry not used', { source: debugUrl(url), reason: 'exceeds maxCrlBytes',
-                                                              bytes: list.size, maxCrlBytes: options.policy.maxCrlBytes });
-                        list = undefined;
-                    }
-                    if (! list) {
-                        bytes = await downloadCrl(url, signal, debug, options.policy.maxCrlBytes);
-                    }
-                } catch (cause) {
-                    signal?.throwIfAborted();
-                    failures.push(issue('unreachableCrlDistributionPoint',
-                                        `Unreachable CRL distribution point ${sourceLabel(source)}: ${cause.message}`, cause, source));
-                    continue;
-                }
-            }
-            let result;
-            try {
-                if (! list) {
-                    const label = (source === undefined) ? 'trFetchCrlOverride' : debugUrl(source);
-                    const parsed = parseCrl(bytes, options.policy.maxCrlBytes);
-                    debug?.('CRL parsed', { source: label, revokedEntries: parsed.revokedCount });
-                    list = await authenticateCrl(parsed, issuer);
-                    debug?.('CRL authenticated and indexed', { source: label, serials: list.serials.count,
-                                                               indexBytes: list.serials.bytes });
-                }
-                result = await checkRevocationList(list, certificate, issuer, point.urls);
-            } catch (cause) {
-                failures.push(issue('invalidCrl',
-                                    `Invalid CRL from ${(source === undefined) ? 'trFetchCrlOverride' : sourceLabel(source)}: ${cause.message}`, cause, source));
+            const byCertificate = (forcedCrl === undefined) && (options.policy.crlCacheScope === 'certificate');
+            const result = byCertificate ? await checkByCertificate(source, point) : await checkByCrl(source, point);
+            if (result === undefined) {
                 continue;
-            }
-            if ((key !== undefined) && (bytes !== undefined)) {
-                cache.set(key, list, result.nextUpdate, fetchedAt, options.cacheSize, options.cacheTTL, Date.now(), debug);
             }
             debug?.('CRL serial lookup completed', { source: (source === undefined) ? 'trFetchCrlOverride' : debugUrl(source),
                                                      result: result.revoked ? 'revoked' : 'not listed', authenticated: true,

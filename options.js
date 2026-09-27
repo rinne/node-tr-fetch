@@ -5,6 +5,7 @@ const DEFAULT_MAX_CRL_BYTES = 16 * 1024 * 1024;
 const DEFAULT_POLICY = {
     disabled: false,
     maxCrlBytes: DEFAULT_MAX_CRL_BYTES,
+    crlCacheScope: 'crl',
     missingCrlDistributionPoint: 'ignore',
     unreachableCrlDistributionPoint: 'reject',
     invalidCrl: 'reject',
@@ -63,6 +64,11 @@ function parsePolicy(value, defaults, name) {
                 throw new TypeError(`${name}.maxCrlBytes must be a positive safe integer (bytes)`);
             }
             policy.maxCrlBytes = setting;
+        } else if (key === 'crlCacheScope') {
+            if (! [ 'crl', 'certificate' ].includes(setting)) {
+                throw new TypeError(`${name}.crlCacheScope must be crl or certificate`);
+            }
+            policy.crlCacheScope = setting;
         } else {
             if (! [ 'ignore', 'warn', 'reject' ].includes(setting)) {
                 throw new TypeError(`${name}.${key} must be ignore, warn or reject`);

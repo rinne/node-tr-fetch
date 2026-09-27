@@ -82,7 +82,7 @@ test('defaults, partial policy and stripping without mutating caller options', f
     assert.equal(options.cacheSize, 32);
     assert.equal(options.cacheTTL, -1);
     assert.deepEqual(options.policy, {
-        disabled: false, maxCrlBytes: 16777216,
+        disabled: false, maxCrlBytes: 16777216, crlCacheScope: 'crl',
         missingCrlDistributionPoint: 'ignore', unreachableCrlDistributionPoint: 'reject', invalidCrl: 'warn', revokedCertificate: 'reject'
     });
     assert.equal(splitOptions().cacheTTL, 1800);
@@ -235,4 +235,89 @@ test('every module the package loads is listed in package.json files', function(
         }
     }
     assert.ok(seen.has('serials.js'));
+});
+
+test('crlCacheScope accepts crl or certificate, only in the CRL policy', function() {
+    assert.equal(splitOptions().policy.crlCacheScope, 'crl');
+    for (const value of [ 'crl', 'certificate' ]) {
+        assert.equal(splitOptions({ trFetchCrlPolicy: { crlCacheScope: value } }).policy.crlCacheScope, value);
+    }
+    for (const value of [ 'CRL', 'Certificate', 'cert', '', null, undefined, 1, true, [ 'crl' ] ]) {
+        assert.throws(() => splitOptions({ trFetchCrlPolicy: { crlCacheScope: value } }), /crlCacheScope must be crl or certificate/);
+    }
+    assert.throws(() => splitOptions({ trFetchOcspPolicy: { crlCacheScope: 'crl' } }), /Unknown trFetchOcspPolicy property/);
+});
+
+test('per-certificate CRL results: fresh hits, stale candidates, and results that never go backwards', function() {
+    const { CrlResultCache, STALE_CANDIDATE_LIFETIME } = require('../cache');
+    const cache = new CrlResultCache();
+    const events = [];
+    const debug = (event, details) => events.push({ event, ...details });
+    const fields = (id, group, thisUpdate, listed = false) => ({ issuerId: 'i', certificateId: id, url: `http://ca.example/${group}.crl`,
+        group, serial: Buffer.from(id), isCA: false, urls: [ `http://ca.example/${group}.crl` ], listed,
+        thisUpdate, nextUpdate: thisUpdate + 10000, fetchedAt: thisUpdate, size: 100 });
+    const lookup = (key, now, ttl = -1, maxBytes = 1000) => cache.lookup(key, 4, ttl, maxBytes, now, debug);
+    assert.equal(lookup('a', 1000), undefined);
+    assert.equal(cache.store('a', fields('a', 'x', 1000), 4, -1, 1000, debug), true);
+    assert.equal(lookup('a', 1500).listed, false);
+    // Expiry at nextUpdate makes the entry stale: no answer, still a candidate.
+    assert.equal(lookup('a', 11000), undefined);
+    assert.ok(events.some(x => (x.event === 'CRL result cache stale') && (x.reason === 'CRL nextUpdate')));
+    assert.deepEqual(cache.candidates('x', 'b', 4, -1).map(([key]) => key), [ 'a' ]);
+    assert.deepEqual(cache.candidates('x', 'a', 4, -1), []);
+    assert.deepEqual(cache.candidates('y', 'b', 4, -1), []);
+    // A refresh from a newer CRL makes it fresh again.
+    assert.equal(cache.store('a', fields('a', 'x', 12000, true), 4, -1, 12000, debug, false), true);
+    assert.equal(lookup('a', 12500).listed, true);
+    // An older CRL never replaces a newer result; the same CRL may.
+    assert.equal(cache.store('a', fields('a', 'x', 11000, false), 4, -1, 12600, debug), false);
+    assert.ok(events.some(x => (x.event === 'CRL result cache store skipped') && /newer CRL/.test(x.reason)));
+    assert.equal(lookup('a', 12700).listed, true);
+    assert.equal(cache.store('a', fields('a', 'x', 12000, false), 4, -1, 12800, debug), true);
+    assert.equal(lookup('a', 12900).listed, false);
+    // Caller TTL and size limit make an entry stale, not gone.
+    assert.equal(lookup('a', 14000, 1), undefined);
+    assert.ok(events.some(x => (x.event === 'CRL result cache stale') && (x.reason === 'caller TTL')));
+    assert.equal(lookup('a', 14000, -1, 99), undefined);
+    assert.ok(events.some(x => (x.event === 'CRL result cache stale') && (x.reason === 'exceeds maxCrlBytes')));
+    assert.equal(lookup('a', 14000).listed, false);
+    // Stale candidates are dropped after a day without lookups.
+    const staleAt = 12000 + 10000;
+    assert.equal(lookup('a', staleAt + 1), undefined);
+    cache.prune(4, staleAt + 1 + STALE_CANDIDATE_LIFETIME, debug);
+    assert.equal(cache.candidates('x', 'b', 4, -1).length, 1);
+    cache.prune(4, staleAt + 2 + STALE_CANDIDATE_LIFETIME, debug);
+    assert.equal(cache.candidates('x', 'b', 4, -1).length, 0);
+    assert.ok(events.some(x => (x.event === 'CRL result cache candidate dropped') && (x.reason === 'unused')));
+});
+
+test('per-certificate CRL results: refreshes are not uses, and the cache can be disabled', function() {
+    const { CrlResultCache } = require('../cache');
+    const cache = new CrlResultCache();
+    const fields = (id, thisUpdate = 1000) => ({ issuerId: 'i', certificateId: id, url: 'http://ca.example/x.crl', group: 'x',
+        serial: Buffer.from(id), isCA: false, urls: [], listed: false, thisUpdate, nextUpdate: thisUpdate + 100000,
+        fetchedAt: thisUpdate, size: 1 });
+    cache.store('a', fields('a'), 2, -1, 1000);
+    cache.store('b', fields('b'), 2, -1, 1001);
+    // Refreshing a does not make it recently used, so storing c evicts a.
+    cache.store('a', fields('a', 1002), 2, -1, 1002, undefined, false);
+    cache.store('c', fields('c'), 2, -1, 1003);
+    assert.equal(cache.lookup('a', 2, -1, 10, 1004), undefined);
+    assert.deepEqual(cache.candidates('x', 'z', 2, -1).map(([key]) => key).sort(), [ 'b', 'c' ]);
+    // A lookup is a use, even of a stale entry, and keeps it over others.
+    cache.lookup('b', 2, -1, 10, 1005);
+    cache.store('d', fields('d'), 2, -1, 1006);
+    assert.deepEqual(cache.candidates('x', 'z', 2, -1).map(([key]) => key).sort(), [ 'b', 'd' ]);
+    // Expiry is the earlier of nextUpdate and the TTL.
+    cache.store('e', fields('e', 2000), 8, 1, 2000);
+    assert.notEqual(cache.lookup('e', 8, -1, 10, 2999), undefined);
+    assert.equal(cache.lookup('e', 8, -1, 10, 3000), undefined);
+    for (const [size, ttl] of [ [ 0, -1 ], [ -1, -1 ], [ 8, 0 ] ]) {
+        const disabled = new CrlResultCache();
+        assert.equal(disabled.store('a', fields('a'), size, ttl, 1000), false);
+        assert.equal(disabled.lookup('a', size, ttl, 10, 1000), undefined);
+        assert.deepEqual(disabled.candidates('x', 'z', size, ttl), []);
+    }
+    cache.remove('d');
+    assert.equal(cache.lookup('d', 2, -1, 10, 1007), undefined);
 });
