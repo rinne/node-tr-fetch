@@ -396,6 +396,30 @@ test('--tr-fetch-crl-certificate-cache-size sets trFetchCrlPolicy.crlCertificate
     }
 });
 
+test('--tr-fetch-ocsp-cache-size and --tr-fetch-ocsp-cache-ttl set the OCSP cache policy', async function() {
+    const help = (await curl([ '--help' ])).stdout;
+    assert.match(help, /--tr-fetch-ocsp-cache-size <count>/);
+    assert.match(help, /--tr-fetch-ocsp-cache-ttl <seconds>/);
+    const settings = async args => {
+        const result = await curl([ '-s', '-v', '--cacert', caFile, '-o', path.join(tmp, 'ocsp'), ...args, secureUrl ]);
+        assert.equal(result.code, 0, args.join(' '));
+        return [ Number(result.stderr.match(/"ocspCacheSize":(-?\d+)/)[1]), Number(result.stderr.match(/"ocspCacheTTL":(-?\d+)/)[1]) ];
+    };
+    assert.deepEqual(await settings([]), [ 1024, 1800 ]);
+    assert.deepEqual(await settings([ '--tr-fetch-ocsp-cache-size', '8', '--tr-fetch-ocsp-cache-ttl', '60' ]), [ 8, 60 ]);
+    assert.deepEqual(await settings([ '--tr-fetch-ocsp-cache-size', '0', '--tr-fetch-ocsp-cache-ttl=-1' ]), [ 0, -1 ]);
+    // Merged into the OCSP policy, over the same settings in --tr-fetch-options.
+    assert.deepEqual(await settings([ '--tr-fetch-options', '{"trFetchOcspPolicy":{"ocspCacheSize":3,"ocspCacheTTL":5}}',
+        '--tr-fetch-ocsp-cache-ttl', '7' ]), [ 3, 7 ]);
+    const merged = await curl([ '-sS', '--cacert', caFile, '--tr-fetch-ocsp-cache-ttl', '0',
+        '--tr-fetch-options', '{"trFetchCrlPolicy":{"disabled":true},"trFetchOcspPolicy":{"rejectedCertificate":"ignore"}}', revokedUrl ]);
+    assert.equal(merged.code, 0);
+    for (const args of [ [ '--tr-fetch-ocsp-cache-size', '1.5' ], [ '--tr-fetch-ocsp-cache-size', 'x' ], [ '--tr-fetch-ocsp-cache-ttl', '-2' ],
+        [ '--tr-fetch-ocsp-cache-ttl', '1.5' ], [ '--tr-fetch-ocsp-cache-ttl', '' ] ]) {
+        assert.equal((await curl([ '-s', ...args, secureUrl ])).code, 2, args.join(' '));
+    }
+});
+
 test('--insecure bypasses TLS verification and revocation checks', async function() {
     assert.equal((await curl([ '-s', untrustedUrl ])).code, 60);
     let result = await curl([ '-s', '-k', untrustedUrl ]);

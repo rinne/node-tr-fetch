@@ -18,6 +18,8 @@ const DEFAULT_POLICY = {
 
 const DEFAULT_OCSP_POLICY = {
     disabled: false,
+    ocspCacheSize: 1024,
+    ocspCacheTTL: 1800,
     ocspCheckDepth: 0,
     missingOcspUri: 'ignore',
     unreachableOcspUri: 'reject',
@@ -73,17 +75,18 @@ function parsePolicy(value, defaults, name) {
                 throw new TypeError(`${name}.crlCacheScope must be crl or certificate`);
             }
             policy.crlCacheScope = setting;
-        } else if ((key === 'crlCacheSize') || (key === 'crlCertificateCacheSize')) {
+        } else if ([ 'crlCacheSize', 'crlCertificateCacheSize', 'ocspCacheSize' ].includes(key)) {
             // Entries; 0 or less disables that cache. Null means the default.
             if ((setting != null) && ! Number.isSafeInteger(setting)) {
                 throw new TypeError(`${name}.${key} must be a safe integer`);
             }
             policy[key] = setting ?? defaults[key];
-        } else if (key === 'crlCacheTTL') {
+        } else if ((key === 'crlCacheTTL') || (key === 'ocspCacheTTL')) {
+            // Seconds; -1 means no limit beyond the data's own validity.
             if ((setting != null) && (! Number.isSafeInteger(setting) || (setting < -1))) {
-                throw new TypeError(`${name}.crlCacheTTL must be -1 or a nonnegative safe integer (seconds)`);
+                throw new TypeError(`${name}.${key} must be -1 or a nonnegative safe integer (seconds)`);
             }
-            policy.crlCacheTTL = setting ?? defaults.crlCacheTTL;
+            policy[key] = setting ?? defaults[key];
         } else if ((key === 'crlCheckDepth') || (key === 'ocspCheckDepth')) {
             policy[key] = parseDepth(setting, `${name}.${key}`);
         } else {

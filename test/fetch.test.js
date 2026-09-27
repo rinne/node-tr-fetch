@@ -100,7 +100,7 @@ test('debug traces CRL/OCSP discovery, authenticated results and cache use witho
     });
     const events = captureDebug(t);
     for (const trFetchDebug of [ undefined, false ]) {
-        await (await trFetch(server.url, { trFetchDebug, trFetchCrlPolicy: { crlCacheTTL: 0 } })).text();
+        await (await trFetch(server.url, { trFetchDebug, trFetchCrlPolicy: { crlCacheTTL: 0 }, trFetchOcspPolicy: { ocspCacheTTL: 0 } })).text();
     }
     assert.equal(events.length, 0);
     await (await trFetch(server.url + '/?token=application-secret', {
@@ -133,7 +133,9 @@ test('debug traces CRL/OCSP discovery, authenticated results and cache use witho
     assert.ok(events.some(x => x.event === 'CRL cache hit'));
     assert.ok(! events.some(x => x.event === 'CRL fetched'));
     assert.ok(events.some(x => x.event === 'CRL serial lookup completed'));
-    assert.ok(events.some(x => x.event === 'OCSP response fetched'));
+    assert.ok(events.some(x => x.event === 'OCSP cache hit'));
+    assert.ok(! events.some(x => x.event === 'OCSP response fetched'));
+    assert.ok(events.some(x => (x.event === 'OCSP check completed') && (x.result === 'good') && (x.cached === true)));
 });
 
 test('debug shows CRL and OCSP rejection and warning/ignore policies without changing enforcement', async function(t) {
@@ -690,7 +692,8 @@ test('OCSP is enabled by default, posts fresh requests and does not forward appl
     routes.set('/ocsp-good', ocspRoute(ca));
     const server = await endpoint(t, { ocspUrls: [ crlBase + '/ocsp-good' ] });
     for (let i = 0; i < 2; i++) {
-        await (await trFetch(server.url, { headers: { authorization: 'Bearer secret', cookie: 'secret=1' } })).text();
+        await (await trFetch(server.url, { headers: { authorization: 'Bearer secret', cookie: 'secret=1' },
+                                           trFetchOcspPolicy: { ocspCacheTTL: 0 } })).text();
     }
     const requests = crlRequests.filter(x => x.url === '/ocsp-good');
     assert.equal(requests.length, 2);
@@ -700,6 +703,87 @@ test('OCSP is enabled by default, posts fresh requests and does not forward appl
         assert.equal(request.headers.authorization, undefined);
         assert.equal(request.headers.cookie, undefined);
     }
+});
+
+test('authenticated good and revoked OCSP results are cached; unknown and invalid ones are not', async function(t) {
+    const count = path => crlRequests.filter(x => x.url === path).length;
+    const noCrl = { trFetchCrlPolicy: { disabled: true } };
+    routes.set('/oc-good', ocspRoute(ca));
+    const good = await endpoint(t, { ocspUrls: [ crlBase + '/oc-good' ], serial: 81 });
+    const events = captureDebug(t);
+    await (await trFetch(good.url, { ...noCrl, trFetchDebug: true })).text();
+    await (await trFetch(good.url, { ...noCrl, trFetchDebug: true })).text();
+    assert.equal(count('/oc-good'), 1);
+    assert.ok(events.some(x => (x.event === 'OCSP cache stored') && (x.certificate.length === 16)));
+    assert.ok(events.some(x => (x.event === 'OCSP check completed') && (x.cached === true) && (x.result === 'good')));
+    t.mock.restoreAll();
+    // Another certificate from the same responder is a separate entry.
+    const other = await endpoint(t, { ocspUrls: [ crlBase + '/oc-good' ], serial: 82 });
+    await (await trFetch(other.url, noCrl)).text();
+    assert.equal(count('/oc-good'), 2);
+    // A revoked result is cached and keeps rejecting without a request.
+    routes.set('/oc-revoked', ocspRoute(ca, { status: 'revoked' }));
+    const revoked = await endpoint(t, { ocspUrls: [ crlBase + '/oc-revoked' ], serial: 83 });
+    for (let i = 0; i < 2; i++) {
+        await assert.rejects(trFetch(revoked.url, noCrl), { code: 'TR_FETCH_OCSP_CERTIFICATE_REJECTED', ocspStatus: 'revoked' });
+    }
+    assert.equal(count('/oc-revoked'), 1);
+    assert.equal(revoked.hits(), 0);
+    // Unknown statuses and unusable responses are asked again every time.
+    routes.set('/oc-unknown', ocspRoute(ca, { status: 'unknown' }));
+    routes.set('/oc-invalid', (req, res) => res.end('not an OCSP response'));
+    for (const path of [ '/oc-unknown', '/oc-invalid' ]) {
+        const server = await endpoint(t, { ocspUrls: [ crlBase + path ], serial: 84 });
+        for (let i = 0; i < 2; i++) {
+            await assert.rejects(trFetch(server.url, noCrl), { code: 'TR_FETCH_OCSP_CERTIFICATE_REJECTED' });
+        }
+        assert.equal(count(path), 2, path);
+    }
+    // The responder URL is part of the key: an override is a separate entry.
+    routes.set('/oc-override', ocspRoute(ca));
+    await (await trFetch(good.url, { ...noCrl, trFetchOcspUriOverride: crlBase + '/oc-override' })).text();
+    await (await trFetch(good.url, { ...noCrl, trFetchOcspUriOverride: crlBase + '/oc-override' })).text();
+    assert.equal(count('/oc-override'), 1);
+    assert.equal(count('/oc-good'), 2);
+});
+
+test('OCSP results are cached until the earlier of nextUpdate and the TTL, within the size limit', async function(t) {
+    const count = path => crlRequests.filter(x => x.url === path).length;
+    const ocsp = options => ({ trFetchCrlPolicy: { disabled: true }, trFetchOcspPolicy: options });
+    routes.set('/oc-ttl', ocspRoute(ca));
+    const server = await endpoint(t, { ocspUrls: [ crlBase + '/oc-ttl' ], serial: 85 });
+    // TTL 0 disables caching.
+    await (await trFetch(server.url, ocsp({ ocspCacheTTL: 0 }))).text();
+    await (await trFetch(server.url, ocsp({ ocspCacheTTL: 0 }))).text();
+    assert.equal(count('/oc-ttl'), 2);
+    // Cached with the default TTL; a later caller's shorter TTL still applies.
+    await (await trFetch(server.url, ocsp({}))).text();
+    assert.equal(count('/oc-ttl'), 3);
+    await new Promise(resolve => setTimeout(resolve, 1100));
+    await (await trFetch(server.url, ocsp({}))).text();
+    assert.equal(count('/oc-ttl'), 3);
+    await (await trFetch(server.url, ocsp({ ocspCacheTTL: 1 }))).text();
+    assert.equal(count('/oc-ttl'), 4);
+    // A response whose nextUpdate comes before the TTL expires with it.
+    routes.set('/oc-short', ocspRoute(ca, { end: Date.now() + 1500 }));
+    const short = await endpoint(t, { ocspUrls: [ crlBase + '/oc-short' ], serial: 86 });
+    await (await trFetch(short.url, ocsp({ ocspCacheTTL: -1 }))).text();
+    await (await trFetch(short.url, ocsp({ ocspCacheTTL: -1 }))).text();
+    assert.equal(count('/oc-short'), 1);
+    await new Promise(resolve => setTimeout(resolve, 1600));
+    routes.set('/oc-short', ocspRoute(ca));
+    await (await trFetch(short.url, ocsp({ ocspCacheTTL: -1 }))).text();
+    assert.equal(count('/oc-short'), 2);
+    // Size 0 disables caching; size 1 keeps only the latest certificate.
+    routes.set('/oc-size', ocspRoute(ca));
+    const [a, b] = await Promise.all([ 87, 88 ].map(serial => endpoint(t, { ocspUrls: [ crlBase + '/oc-size' ], serial })));
+    await (await trFetch(a.url, ocsp({ ocspCacheSize: 0 }))).text();
+    await (await trFetch(a.url, ocsp({ ocspCacheSize: 0 }))).text();
+    assert.equal(count('/oc-size'), 2);
+    await (await trFetch(a.url, ocsp({ ocspCacheSize: 1 }))).text();
+    await (await trFetch(b.url, ocsp({ ocspCacheSize: 1 }))).text();
+    await (await trFetch(a.url, ocsp({ ocspCacheSize: 1 }))).text();
+    assert.equal(count('/oc-size'), 5);
 });
 
 test('OCSP revoked and unknown statuses reject before application HTTP data is sent', async function(t) {
@@ -795,18 +879,18 @@ test('OCSP depth is independent of CRL depth and overrides apply only to the lea
     const server = await endpoint(t, { issuer: intermediate, chain: intermediate.pem });
     for (const depth of [ undefined, 0, 'leaf' ]) {
         await (await trFetch(server.url, {
-            trFetchCrlPolicy: { crlCheckDepth: 'full-chain' }, trFetchOcspPolicy: { ocspCheckDepth: depth },
+            trFetchCrlPolicy: { crlCheckDepth: 'full-chain' }, trFetchOcspPolicy: { ocspCheckDepth: depth, ocspCacheTTL: 0 },
             trFetchOcspUriOverride: crlBase + '/ocsp-leaf'
         })).text();
     }
     for (const depth of [ 1, 2, 'full-chain' ]) {
         await assert.rejects(trFetch(server.url, { trFetchCrlPolicy: { crlCheckDepth: 0 },
-                                                   trFetchOcspPolicy: { ocspCheckDepth: depth }, trFetchOcspUriOverride: crlBase + '/ocsp-leaf'
+                                                   trFetchOcspPolicy: { ocspCheckDepth: depth, ocspCacheTTL: 0 }, trFetchOcspUriOverride: crlBase + '/ocsp-leaf'
                                                  }), { code: 'TR_FETCH_OCSP_CERTIFICATE_REJECTED', serialNumber: '64' });
     }
     routes.set('/ocsp-intermediate', ocspRoute(ca));
     await (await trFetch(server.url, { trFetchOcspUriOverride: crlBase + '/ocsp-leaf',
-                                       trFetchOcspPolicy: { ocspCheckDepth: 'full-chain', missingOcspUri: 'reject' }
+                                       trFetchOcspPolicy: { ocspCheckDepth: 'full-chain', missingOcspUri: 'reject', ocspCacheTTL: 0 }
                                      })).text();
 });
 

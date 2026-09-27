@@ -207,7 +207,8 @@ test('CRL URLs accept only HTTP(S), never files, LDAP or URL credentials', funct
 
 test('OCSP defaults, depth, override and disabled policy options are validated and stripped', function() {
     assert.deepEqual(splitOptions().ocspPolicy, {
-        disabled: false, ocspCheckDepth: 0, missingOcspUri: 'ignore', unreachableOcspUri: 'reject', rejectedCertificate: 'reject'
+        disabled: false, ocspCacheSize: 1024, ocspCacheTTL: 1800, ocspCheckDepth: 0,
+        missingOcspUri: 'ignore', unreachableOcspUri: 'reject', rejectedCertificate: 'reject'
     });
     for (const [depth, expected] of [ [ undefined, 0 ], [ 0, 0 ], [ 'leaf', 0 ], [ 2, 2 ], [ 'full-chain', Infinity ] ]) {
         const result = splitOptions({ trFetchOcspPolicy: { ocspCheckDepth: depth }, trFetchOcspUriOverride: new URL('https://ca.example/ocsp') });
@@ -421,4 +422,39 @@ test('applyPolicy delivers warnings to the callback instead of process warnings'
     applyPolicy({ invalidCrl: 'warn' }, crl());
     assert.equal(emitted.length, 1);
     assert.equal(emitted[0].name, 'TrFetchCrlWarning');
+});
+
+test('OCSP cache size and TTL are OCSP policy settings with CRL-like validation', function() {
+    assert.equal(splitOptions().ocspPolicy.ocspCacheSize, 1024);
+    assert.equal(splitOptions().ocspPolicy.ocspCacheTTL, 1800);
+    for (const value of [ -1, 0, 1, 5000 ]) {
+        assert.equal(splitOptions({ trFetchOcspPolicy: { ocspCacheSize: value } }).ocspPolicy.ocspCacheSize, value);
+    }
+    for (const value of [ -1, 0, 60, 86400 ]) {
+        assert.equal(splitOptions({ trFetchOcspPolicy: { ocspCacheTTL: value } }).ocspPolicy.ocspCacheTTL, value);
+    }
+    assert.equal(splitOptions({ trFetchOcspPolicy: { ocspCacheSize: null, ocspCacheTTL: undefined } }).ocspPolicy.ocspCacheSize, 1024);
+    for (const value of [ 1.5, '10', true, Infinity ]) {
+        assert.throws(() => splitOptions({ trFetchOcspPolicy: { ocspCacheSize: value } }), /trFetchOcspPolicy\.ocspCacheSize must be a safe integer/);
+    }
+    for (const value of [ -2, 1.5, '1800', Infinity ]) {
+        assert.throws(() => splitOptions({ trFetchOcspPolicy: { ocspCacheTTL: value } }),
+                      /trFetchOcspPolicy\.ocspCacheTTL must be -1 or a nonnegative safe integer/);
+    }
+    for (const key of [ 'ocspCacheSize', 'ocspCacheTTL' ]) {
+        assert.throws(() => splitOptions({ trFetchCrlPolicy: { [key]: 1 } }), /Unknown trFetchCrlPolicy property/);
+    }
+});
+
+test('the expiring cache reports its own label, and CRL cache events are unchanged', function() {
+    const { ExpiringCache } = require('../cache');
+    for (const [cache, label] of [ [ new ExpiringCache(), 'CRL cache' ], [ new ExpiringCache('OCSP cache', key => ({ key })), 'OCSP cache' ] ]) {
+        const events = [];
+        const debug = event => events.push(event);
+        assert.equal(cache.get('i:http://x/', 8, 60, 1000, debug), undefined);
+        cache.set('i:http://x/', 'value', 100000, 1000, 8, 60, 1000, debug);
+        assert.equal(cache.get('i:http://x/', 8, 60, 2000, debug), 'value');
+        assert.equal(cache.get('i:http://x/', 8, 60, 61000, debug), undefined);
+        assert.deepEqual(events, [ 'miss', 'stored', 'hit', 'expired', 'miss' ].map(x => `${label} ${x}`));
+    }
 });

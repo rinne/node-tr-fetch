@@ -7,63 +7,72 @@ function cacheEntry(key) {
     return { issuer: key.slice(0, separator), source: debugUrl(key.slice(separator + 1)) };
 }
 
-// Cache authenticated revocation lists (see RevocationList in crl.js), never
-// a policy decision, a failed lookup or the CRL bytes. A caller's shorter TTL
-// also applies to entries populated by an earlier caller.
-class CrlCache {
+// An LRU cache whose entries expire at the earlier of their own validity
+// and the TTL in force when they were stored. A caller's shorter TTL also
+// applies to entries populated by an earlier caller. Used for authenticated
+// revocation lists (see RevocationList in crl.js), never a policy decision, a
+// failed lookup or the CRL bytes, and for authenticated OCSP results.
+class ExpiringCache {
     #entries = new Map();
+    #label;
+    #describe;
+
+    constructor(label = 'CRL cache', describe = cacheEntry) {
+        this.#label = label;
+        this.#describe = describe;
+    }
 
     prune(size, now = Date.now(), debug) {
         for (const [key, entry] of this.#entries) {
             if (now >= entry.expiresAt) {
                 this.#entries.delete(key);
-                debug?.('CRL cache expired', { ...cacheEntry(key),
+                debug?.(`${this.#label} expired`, { ...this.#describe(key),
                                                reason: (entry.expiresAt === entry.nextUpdate) ? 'CRL nextUpdate' : 'TTL', expiresAt: entry.expiresAt });
             }
         }
         while (this.#entries.size > Math.max(0, size)) {
             const key = this.#entries.keys().next().value;
             this.#entries.delete(key);
-            debug?.('CRL cache purged', { ...cacheEntry(key), reason: (size <= 0) ? 'cache disabled' : 'LRU capacity', size });
+            debug?.(`${this.#label} purged`, { ...this.#describe(key), reason: (size <= 0) ? 'cache disabled' : 'LRU capacity', size });
         }
     }
 
     get(key, size, ttl, now = Date.now(), debug) {
         this.prune(size, now, debug);
         if ((size <= 0) || (ttl === 0)) {
-            debug?.('CRL cache bypassed', { ...cacheEntry(key), reason: 'cache disabled', size, ttl });
+            debug?.(`${this.#label} bypassed`, { ...this.#describe(key), reason: 'cache disabled', size, ttl });
             return undefined;
         }
         const entry = this.#entries.get(key);
         if (! entry) {
-            debug?.('CRL cache miss', cacheEntry(key));
+            debug?.(`${this.#label} miss`, this.#describe(key));
             return undefined;
         }
         if ((ttl !== -1) && ((now - entry.fetchedAt) >= (ttl * 1000))) {
             this.#entries.delete(key);
-            debug?.('CRL cache expired', { ...cacheEntry(key), reason: 'caller TTL', ttl, ageSeconds: (now - entry.fetchedAt) / 1000 });
+            debug?.(`${this.#label} expired`, { ...this.#describe(key), reason: 'caller TTL', ttl, ageSeconds: (now - entry.fetchedAt) / 1000 });
             return undefined;
         }
         this.#entries.delete(key);
         this.#entries.set(key, entry);
-        debug?.('CRL cache hit', { ...cacheEntry(key), ageSeconds: (now - entry.fetchedAt) / 1000, expiresAt: entry.expiresAt });
+        debug?.(`${this.#label} hit`, { ...this.#describe(key), ageSeconds: (now - entry.fetchedAt) / 1000, expiresAt: entry.expiresAt });
         return entry.value;
     }
 
     set(key, value, nextUpdate, fetchedAt, size, ttl, now = Date.now(), debug) {
         this.prune(size, now, debug);
         if ((size <= 0) || (ttl === 0)) {
-            debug?.('CRL cache store skipped', { ...cacheEntry(key), reason: 'cache disabled', size, ttl });
+            debug?.(`${this.#label} store skipped`, { ...this.#describe(key), reason: 'cache disabled', size, ttl });
             return;
         }
         const expiresAt = Math.min(nextUpdate, (ttl === -1) ? Infinity : fetchedAt + (ttl * 1000));
         if (expiresAt <= now) {
-            debug?.('CRL cache store skipped', { ...cacheEntry(key), reason: 'already expired', expiresAt });
+            debug?.(`${this.#label} store skipped`, { ...this.#describe(key), reason: 'already expired', expiresAt });
             return;
         }
         this.#entries.delete(key);
         this.#entries.set(key, { value, fetchedAt, expiresAt, nextUpdate });
-        debug?.('CRL cache stored', { ...cacheEntry(key), expiresAt, nextUpdate, ttl, size });
+        debug?.(`${this.#label} stored`, { ...this.#describe(key), expiresAt, nextUpdate, ttl, size });
         this.prune(size, now, debug);
     }
 }
@@ -179,6 +188,7 @@ class CrlResultCache {
     }
 }
 
-module.exports = CrlCache;
+module.exports = ExpiringCache;
+module.exports.ExpiringCache = ExpiringCache;
 module.exports.CrlResultCache = CrlResultCache;
 module.exports.STALE_CANDIDATE_LIFETIME = STALE_CANDIDATE_LIFETIME;

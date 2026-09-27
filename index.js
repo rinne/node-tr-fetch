@@ -24,7 +24,9 @@ async function trFetch(input, options) {
         crlCertificateCacheSize: config.policy.crlCertificateCacheSize,
         crlCacheTTL: config.policy.crlCacheTTL,
         ocsp: config.ocspPolicy.disabled ? 'disabled' : 'enabled',
-        ocspDepth: (config.ocspPolicy.ocspCheckDepth === Infinity) ? 'full-chain' : config.ocspPolicy.ocspCheckDepth
+        ocspDepth: (config.ocspPolicy.ocspCheckDepth === Infinity) ? 'full-chain' : config.ocspPolicy.ocspCheckDepth,
+        ocspCacheSize: config.ocspPolicy.ocspCacheSize,
+        ocspCacheTTL: config.ocspPolicy.ocspCacheTTL
     });
     const check = (config.policy.disabled && config.ocspPolicy.disabled) ? undefined :
           (peer, hostname) => checkChain(peer, hostname, config, signal);

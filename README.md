@@ -41,6 +41,8 @@ const response = await trFetch(url, {
 	},
 	trFetchOcspPolicy: {
 		disabled: false,
+		ocspCacheSize: 1024,
+		ocspCacheTTL: 1800,
 		ocspCheckDepth: 0,
 		missingOcspUri: 'ignore',
 		unreachableOcspUri: 'reject',
@@ -300,8 +302,8 @@ With TTL `-1`, CRLs still expire at `nextUpdate` and can be evicted by LRU.
 Concurrent misses can download the same CRL independently; cancellation and
 policy decisions remain local to each request.
 
-OCSP responses are not cached. Every checked certificate gets a fresh OCSP
-request; CRL cache options affect only CRLs.
+CRL cache options affect only CRLs; OCSP results have their own cache (see
+[OCSP caching](#ocsp-caching)).
 
 ## Errors and warnings
 
@@ -481,6 +483,30 @@ OCSP responder HTTPS connections receive normal TLS verification. Their own
 revocation endpoints are not recursively queried. This is active OCSP lookup;
 TLS-stapled responses are not consumed.
 
+#### OCSP caching
+
+Authenticated `good` and `revoked` results are cached in memory, keyed by the
+issuer certificate, the checked certificate and the responder URL. A result is
+used until the earlier of the response's `nextUpdate` (itself bounded by the
+signer certificate's expiry, and at most five minutes after `thisUpdate` when
+the responder gives none) and the TTL. `unknown` statuses, failed lookups and
+unusable responses are never cached, so they are asked again every time.
+Cached results are looked up before an OCSP request is built; a hit sends no
+request.
+
+- `trFetchOcspPolicy.ocspCacheSize` defaults to `1024` results. Any integer
+  **0 or less** disables the cache for that call; `null` means the default.
+- `trFetchOcspPolicy.ocspCacheTTL` defaults to `1800` **seconds**. It is a
+  maximum: a response whose `nextUpdate` is sooner expires then. `0` disables
+  caching; `-1` leaves only `nextUpdate`.
+- As with CRLs, a later caller's shorter TTL also applies to existing entries,
+  and reducing the size evicts the least recently used entries.
+
+A cached response is no fresher than the time it was fetched. Its request
+nonce was checked then, and its validity times are the freshness guarantee
+afterwards, as for responders that do not echo nonces. Set `ocspCacheTTL: 0`
+to query the responder on every connection.
+
 The transport uses Node's documented
 [fetch dispatcher interface](https://nodejs.org/api/globals.html#custom-dispatcher)
 and [TLS certificate inspection](https://nodejs.org/api/tls.html#tlssocketgetpeercertificatedetailed).
@@ -521,7 +547,7 @@ tr-curl --cacert private-ca.pem --crlfile current.crl https://internal.example/
 | Failure and limits | `-f/--fail`, `--fail-with-body`, `--fail-early`, `--max-filesize`, `-m/--max-time` |
 | Messages | `-v/--verbose`, `-s/--silent`, `-S/--show-error`, `--no-progress-meter`, `-#/--progress-bar`, `-h/--help`, `-V/--version` |
 | TLS | `-k/--insecure`, `--cacert`, `--crlfile`, `-1/--tlsv1`, `--tlsv1.0` … `--tlsv1.3`, `--tls-max`, `--ciphers`, `--tls13-ciphers` |
-| trFetch | `--tr-fetch-max-crl-bytes`, `--tr-fetch-crl-cache-scope`, `--tr-fetch-crl-certificate-cache-size`, `--tr-fetch-crl-url`, `--tr-fetch-ocsp-url`, `--tr-fetch-options` |
+| trFetch | `--tr-fetch-max-crl-bytes`, `--tr-fetch-crl-cache-scope`, `--tr-fetch-crl-certificate-cache-size`, `--tr-fetch-crl-url`, `--tr-fetch-ocsp-cache-size`, `--tr-fetch-ocsp-cache-ttl`, `--tr-fetch-ocsp-url`, `--tr-fetch-options` |
 
 `--verbose` prints the request and response headers, prefixed with `>` and
 `<` like curl, and also enables `trFetchDebug`, so the revocation diagnostics
@@ -536,15 +562,17 @@ The `--tr-fetch-*` options set trFetch options directly:
 | `--tr-fetch-crl-cache-scope <crl\|certificate>` | `trFetchCrlPolicy.crlCacheScope`; tr-curl's default is `certificate` |
 | `--tr-fetch-crl-certificate-cache-size <count>` | `trFetchCrlPolicy.crlCertificateCacheSize`, an integer |
 | `--tr-fetch-crl-url <url>` | `trFetchCrlDistributionPointOverride` |
+| `--tr-fetch-ocsp-cache-size <count>` | `trFetchOcspPolicy.ocspCacheSize`, an integer |
+| `--tr-fetch-ocsp-cache-ttl <seconds>` | `trFetchOcspPolicy.ocspCacheTTL`, `-1` or more |
 | `--tr-fetch-ocsp-url <url>` | `trFetchOcspUriOverride` |
 | `--crlfile <file>` | `trFetchCrlOverride`, read from the file |
 
 `--tr-fetch-options` takes a JSON object of any trFetch options, for example
 `'{"trFetchCrlPolicy":{"crlCheckDepth":"full-chain"}}'`. It can be repeated;
 later objects replace earlier keys. The options above take precedence over the
-same settings in it, whatever their order, and `--tr-fetch-max-crl-bytes`,
-`--tr-fetch-crl-cache-scope` and `--tr-fetch-crl-certificate-cache-size` are
-merged into its `trFetchCrlPolicy` rather than replacing it.
+same settings in it, whatever their order, and the CRL and OCSP cache and size
+options are merged into its `trFetchCrlPolicy` and `trFetchOcspPolicy` rather
+than replacing them.
 
 `--insecure` cannot be implemented through trFetch, which never relaxes TLS
 verification. With `-k`, tr-curl uses plain fetch with an unverified TLS

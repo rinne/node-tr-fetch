@@ -34,6 +34,10 @@ function integerCb(value) {
     return (/^-?(0|[1-9]\d*)$/.test(value) && Number.isSafeInteger(Number(value))) ? Number(value) : undefined;
 }
 
+function ttlCb(value) {
+    return (/^(-1|0|[1-9]\d*)$/.test(value) && Number.isSafeInteger(Number(value))) ? Number(value) : undefined;
+}
+
 function networkUrlCb(value) {
     return (URL.canParse(value) && [ 'http:', 'https:' ].includes(new URL(value).protocol)) ? value : undefined;
 }
@@ -114,6 +118,8 @@ function optionDefinitions() {
         arg(undefined, 'tr-fetch-crl-certificate-cache-size', '<count> Cached per-certificate CRL results (default 1024; 0 disables)',
             integerCb),
         arg(undefined, 'tr-fetch-crl-url', '<url> Fetch the server certificate\'s CRL from this URL instead', networkUrlCb),
+        arg(undefined, 'tr-fetch-ocsp-cache-size', '<count> Cached OCSP results (default 1024; 0 disables)', integerCb),
+        arg(undefined, 'tr-fetch-ocsp-cache-ttl', '<seconds> Longest OCSP result caching (default 1800; 0 disables, -1 no limit)', ttlCb),
         arg(undefined, 'tr-fetch-ocsp-url', '<url> Query this OCSP responder for the server certificate instead', networkUrlCb),
         arg(undefined, 'tr-fetch-options', '<json> Extra trFetch options as a JSON object', jsonObjectCb, true),
         arg('u', 'user', '<user:password> Server user and password (basic authentication)'),
@@ -150,20 +156,28 @@ function parseArguments(argv) {
     }
     // Dedicated options take precedence over the same settings given in
     // --tr-fetch-options, regardless of their order.
-    const policy = trFetchOptions.trFetchCrlPolicy;
-    // Leave a malformed policy for trFetch to reject.
-    if ((policy === undefined) || (policy && (typeof(policy) === 'object') && ! Array.isArray(policy))) {
-        const merged = { ...policy };
-        if (value('tr-fetch-max-crl-bytes') !== undefined) {
-            merged.maxCrlBytes = value('tr-fetch-max-crl-bytes');
+    // Merge settings into a policy object from --tr-fetch-options; a
+    // malformed one is left for trFetch to reject.
+    function mergePolicy(name, settings) {
+        const policy = trFetchOptions[name];
+        if ((policy !== undefined) && ! (policy && (typeof(policy) === 'object') && ! Array.isArray(policy))) {
+            return;
         }
-        if (value('tr-fetch-crl-certificate-cache-size') !== undefined) {
-            merged.crlCertificateCacheSize = value('tr-fetch-crl-certificate-cache-size');
+        const given = Object.entries(settings).filter(([, setting]) => setting !== undefined);
+        if (given.length) {
+            trFetchOptions[name] = { ...policy, ...Object.fromEntries(given) };
         }
-        // tr-curl streams CRLs by default: its cache lasts one run anyway.
-        merged.crlCacheScope = value('tr-fetch-crl-cache-scope') ?? merged.crlCacheScope ?? 'certificate';
-        trFetchOptions.trFetchCrlPolicy = merged;
     }
+    mergePolicy('trFetchCrlPolicy', {
+        maxCrlBytes: value('tr-fetch-max-crl-bytes'),
+        crlCertificateCacheSize: value('tr-fetch-crl-certificate-cache-size'),
+        // tr-curl streams CRLs by default: its cache lasts one run anyway.
+        crlCacheScope: value('tr-fetch-crl-cache-scope') ?? trFetchOptions.trFetchCrlPolicy?.crlCacheScope ?? 'certificate'
+    });
+    mergePolicy('trFetchOcspPolicy', {
+        ocspCacheSize: value('tr-fetch-ocsp-cache-size'),
+        ocspCacheTTL: value('tr-fetch-ocsp-cache-ttl')
+    });
     if (value('tr-fetch-crl-url') !== undefined) {
         if (value('crlfile') !== undefined) {
             throw new UsageError('--tr-fetch-crl-url and --crlfile cannot be used together');

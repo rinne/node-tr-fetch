@@ -2,11 +2,22 @@
 
 const asn1 = require('asn1js');
 const pki = require('pkijs');
-const { randomBytes, X509Certificate } = require('node:crypto');
+const { createHash, randomBytes, X509Certificate } = require('node:crypto');
 const { cryptoEngine, parseDer, parseCertificate, extensionsById, extensionValue } = require('./pkiutils');
 const { downloadOcsp, networkUrl } = require('./download');
 const { TrFetchOcspError, applyPolicy } = require('./errors');
 const { debugUrl } = require('./debug');
+const { ExpiringCache } = require('./cache');
+
+function ocspEntry(key) {
+    const [issuer, certificate, ...url] = key.split(':');
+    return { issuer, certificate: certificate.slice(0, 16), source: debugUrl(url.join(':')) };
+}
+
+// Authenticated 'good' and 'revoked' results by issuer, certificate and
+// responder URL, until the earlier of the response's nextUpdate (bounded by
+// its signer certificate) and the TTL. Never errors or 'unknown'.
+const cache = new ExpiringCache('OCSP cache', ocspEntry);
 
 const OCSP_ACCESS = '1.3.6.1.5.5.7.48.1';
 const NONCE = '1.3.6.1.5.5.7.48.1.2';
@@ -199,6 +210,21 @@ async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug
             hostname, serialNumber: peer.serialNumber, fingerprint256: peer.fingerprint256, ocspUri: uri, ocspStatus
         }, cause);
     }
+    function responderDebugFor(uri) {
+        return debug ? (event, details) => debug(event, { source: debugUrl(uri), ...details }) : undefined;
+    }
+    function completed(result, uri, responderDebug) {
+        responderDebug?.('OCSP check completed', { result: result.status, authenticated: true,
+                                                   policy: 'rejectedCertificate', configuredAction: policy.rejectedCertificate,
+                                                   action: (result.status === 'good') ? 'continue' : policy.rejectedCertificate,
+                                                   nextUpdate: result.nextUpdate, cached: result.cached });
+        if (result.status !== 'good') {
+            applyPolicy(policy, issue('rejectedCertificate',
+                                      `OCSP rejected certificate: responder reports ${result.status}`, uri, undefined, result.status), responderDebug,
+                        options.warningCb);
+        }
+        return result.nextUpdate;
+    }
     let certificate, uris, issuer, request;
     try {
         certificate = parseCertificate(peer.raw);
@@ -216,6 +242,17 @@ async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug
         applyPolicy(policy, issue('missingOcspUri', 'Missing OCSP responder URI'), debug, options.warningCb);
         return;
     }
+    // Cached results are keyed by issuer, certificate and responder URL, and
+    // are looked up before an OCSP request is built.
+    const identity = (peer.issuerCertificate?.raw === undefined) ? undefined :
+        createHash('sha256').update(peer.issuerCertificate.raw).digest('hex') + ':' + createHash('sha256').update(peer.raw).digest('hex') + ':';
+    const limits = [ policy.ocspCacheSize, policy.ocspCacheTTL ];
+    for (const uri of (identity === undefined) ? [] : uris.slice(0, 32)) {
+        const cached = cache.get(identity + uri, ...limits, Date.now(), debug);
+        if (cached) {
+            return completed({ ...cached, cached: true }, uri, responderDebugFor(uri));
+        }
+    }
     try {
         if (! peer.issuerCertificate?.raw) {
             throw new Error('The verified TLS chain does not expose the issuer certificate');
@@ -229,7 +266,8 @@ async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug
     const failures = [];
     for (const uri of uris.slice(0, 32)) {
         signal?.throwIfAborted();
-        const responderDebug = debug ? (event, details) => debug(event, { source: debugUrl(uri), ...details }) : undefined;
+        const responderDebug = responderDebugFor(uri);
+        const fetchedAt = Date.now();
         let bytes;
         try {
             bytes = await downloadOcsp(networkUrl(uri, 'OCSP responder'), request.bytes, signal, responderDebug);
@@ -245,15 +283,11 @@ async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug
             failures.push(issue('rejectedCertificate', `Invalid OCSP response: ${cause.message}`, uri, cause, 'invalid-response'));
             continue;
         }
-        responderDebug?.('OCSP check completed', { result: result.status, authenticated: true,
-                                                   policy: 'rejectedCertificate', configuredAction: policy.rejectedCertificate,
-                                                   action: (result.status === 'good') ? 'continue' : policy.rejectedCertificate, nextUpdate: result.nextUpdate });
-        if (result.status !== 'good') {
-            applyPolicy(policy, issue('rejectedCertificate',
-                                      `OCSP rejected certificate: responder reports ${result.status}`, uri, undefined, result.status), responderDebug,
-                        options.warningCb);
+        if (result.status !== 'unknown') {
+            cache.set(identity + uri, { status: result.status, nextUpdate: result.nextUpdate }, result.nextUpdate, fetchedAt,
+                      ...limits, Date.now(), debug);
         }
-        return result.nextUpdate;
+        return completed(result, uri, responderDebug);
     }
     if (uris.length > 32) {
         failures.push(issue('unreachableOcspUri', 'OCSP responder URI lookup limit (32) exceeded'));
