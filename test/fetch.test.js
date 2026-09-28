@@ -111,7 +111,7 @@ test('debug traces CRL/OCSP discovery, authenticated results and cache use witho
         urls: [ crlBase + '/debug-crl?token=crl-secret' ], ocspUrls: [ crlBase + '/debug-ocsp?token=ocsp-secret' ]
     });
     const events = captureDebug(t);
-    for (const trFetchDebug of [ undefined, false ]) {
+    for (const trFetchDebug of [ undefined, null, false ]) {
         await (await trFetch(server.url, { ...bothChecks, trFetchDebug, trFetchCrlPolicy: { crlCacheTTL: 0 }, trFetchOcspPolicy: { ocspCacheTTL: 0 } })).text();
     }
     assert.equal(events.length, 0);

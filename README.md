@@ -62,6 +62,10 @@ only when OCSP does not establish a certificate's status (see
 failure policy (in the table below) accepts `'ignore'`, `'warn'` or
 `'reject'`; the other policy settings are described in their own sections.
 
+An option or policy setting given as `undefined` or `null` is the same as one
+not given: its default applies. This holds for every trFetch option, including
+the policy objects themselves and each of their settings.
+
 | Policy | Condition |
 |---|---|
 | `missingCrlDistributionPoint` | The checked certificate has no CRL distribution points extension and no applicable override. |
@@ -82,7 +86,7 @@ relax normal TLS verification.
 
 `trFetchCrlPolicy.maxCrlBytes` is the largest CRL accepted, in bytes. It
 defaults to `16777216` (16 MiB) and must be a positive safe integer; there is
-no value for unlimited. Some public CAs publish much larger CRLs, so raise it
+no value for unlimited (`undefined` and `null` mean the default). Some public CAs publish much larger CRLs, so raise it
 explicitly when needed:
 
 ```js
@@ -203,7 +207,7 @@ Options are still validated. Disabling either check leaves the other enabled;
 disabling both retains mandatory normal TLS trust and hostname verification.
 
 Unknown `trFetch...` options, unknown policy keys and invalid option values
-reject with `TypeError`. Custom options are removed before the request reaches
+reject with `TypeError`, also when their value is `undefined` or `null`. Custom options are removed before the request reaches
 system fetch. The caller's options are not modified.
 
 ### Debug output
@@ -214,9 +218,8 @@ Set `trFetchDebug: true` to write verification diagnostics to **stderr**:
 await trFetch('https://example.com/', { trFetchDebug: true });
 ```
 
-The default is `false` (also when omitted or `undefined`); other values,
-including `null`, reject with `TypeError`. This option is removed before
-calling system fetch.
+It defaults to `false`; `undefined` and `null` also mean `false`. Other values
+reject with `TypeError`. This option is removed before calling system fetch.
 
 Each line starts with `[trFetch debug #N]`, followed by an event and JSON details.
 The ID groups events from the same fetch, including redirects, when calls run
@@ -287,7 +290,8 @@ await trFetch(url, {
 `trFetchCrlDistributionPointOverride` accepts an absolute URL string or `URL`.
 `trFetchCrlOverride` accepts a PEM string, `Buffer`, `Uint8Array` or
 `ArrayBuffer` containing one complete PEM or DER CRL. It is data, never a file
-path. Supplying both options rejects with `TypeError`.
+path. Supplying both options rejects with `TypeError`; one given as `null`
+counts as not supplied.
 
 Either override bypasses the server certificate's advertised distribution
 points. Override CRLs still require a valid signature from the actual issuer,
@@ -417,9 +421,9 @@ The callback receives only the warning; context comes with it as a closure,
 like `requestId` above. It is purely informational and fire-and-forget: it is
 called when the warning arises and never awaited, so it cannot delay, change
 or abort the fetch. If it throws or returns a rejected promise, the error is
-reported with `console.warn` and otherwise ignored. A value that is not a
-function rejects with `TypeError`, and the option is removed before calling
-system fetch.
+reported with `console.warn` and otherwise ignored. `undefined` and `null` mean
+no callback; other values that are not functions reject with `TypeError`. The
+option is removed before calling system fetch.
 
 Normal TLS/network failures keep native fetch's error behavior. Cancellation
 preserves the caller's abort reason.

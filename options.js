@@ -55,21 +55,24 @@ function copyOptions(value, keys) {
     return copy;
 }
 
+// Throughout the options, null means the same as undefined: the default.
 function parsePolicy(value, defaults, name) {
-    if ((value !== undefined) &&
-        ((value === null) || (typeof(value) !== 'object') || Array.isArray(value))) {
+    if ((value != null) && ((typeof(value) !== 'object') || Array.isArray(value))) {
         throw new TypeError(`${name} must be an object`);
     }
     const policy = { ...defaults };
-    for (const [key, setting] of Object.entries(copyOptions(value, Object.keys(defaults)))) {
+    for (const [key, setting] of Object.entries(copyOptions(value ?? undefined, Object.keys(defaults)))) {
         if (! Object.hasOwn(defaults, key)) {
             throw new TypeError(`Unknown ${name} property: ${key}`);
         }
+        if (setting == null) {
+            continue;
+        }
         if (key === 'disabled') {
-            if ((setting != null) && (typeof(setting) !== 'boolean')) {
+            if (typeof(setting) !== 'boolean') {
                 throw new TypeError(`${name}.disabled must be a boolean, null or undefined`);
             }
-            policy.disabled = setting ?? false;
+            policy.disabled = setting;
         } else if (key === 'maxCrlBytes') {
             // Deliberately no value for unlimited; any limit must be explicit.
             if (! Number.isSafeInteger(setting) || (setting <= 0)) {
@@ -82,17 +85,17 @@ function parsePolicy(value, defaults, name) {
             }
             policy.crlCacheScope = setting;
         } else if ([ 'crlCacheSize', 'crlCertificateCacheSize', 'ocspCacheSize' ].includes(key)) {
-            // Entries; 0 or less disables that cache. Null means the default.
-            if ((setting != null) && ! Number.isSafeInteger(setting)) {
+            // Entries; 0 or less disables that cache.
+            if (! Number.isSafeInteger(setting)) {
                 throw new TypeError(`${name}.${key} must be a safe integer`);
             }
-            policy[key] = setting ?? defaults[key];
+            policy[key] = setting;
         } else if ((key === 'crlCacheTTL') || (key === 'ocspCacheTTL')) {
             // Seconds; -1 means no limit beyond the data's own validity.
-            if ((setting != null) && (! Number.isSafeInteger(setting) || (setting < -1))) {
+            if (! Number.isSafeInteger(setting) || (setting < -1)) {
                 throw new TypeError(`${name}.${key} must be -1 or a nonnegative safe integer (seconds)`);
             }
-            policy[key] = setting ?? defaults[key];
+            policy[key] = setting;
         } else if (key === 'strategy') {
             if (! [ 'both', 'ocsp-first', 'crl-first' ].includes(setting)) {
                 throw new TypeError(`${name}.strategy must be both, ocsp-first or crl-first`);
@@ -111,7 +114,7 @@ function parsePolicy(value, defaults, name) {
 }
 
 function parseDepth(value, name) {
-    if ((value == null) || (value === 'leaf')) {
+    if (value === 'leaf') {
         return 0;
     }
     if (value === 'full-chain') {
@@ -134,15 +137,21 @@ function splitOptions(options) {
             throw new TypeError(`Unknown trFetch option: ${key}`);
         }
     }
-    const debugEnabled = (fetchOptions.trFetchDebug === undefined) ? false : fetchOptions.trFetchDebug;
+    // A trFetch option given as null is the same as one not given.
+    for (const key of CUSTOM_OPTIONS) {
+        if (fetchOptions[key] === null) {
+            fetchOptions[key] = undefined;
+        }
+    }
+    const debugEnabled = fetchOptions.trFetchDebug ?? false;
     if (typeof(debugEnabled) !== 'boolean') {
-        throw new TypeError('trFetchDebug must be a boolean');
+        throw new TypeError('trFetchDebug must be a boolean, null or undefined');
     }
     // Receives policy warnings instead of process.emitWarning; a fire-and-
     // forget notification whose outcome never affects the fetch.
     const warningCb = fetchOptions.trFetchWarningCb;
     if ((warningCb !== undefined) && (typeof(warningCb) !== 'function')) {
-        throw new TypeError('trFetchWarningCb must be a function');
+        throw new TypeError('trFetchWarningCb must be a function, null or undefined');
     }
     const policy = parsePolicy(fetchOptions.trFetchCrlPolicy, DEFAULT_POLICY, 'trFetchCrlPolicy');
     const ocspPolicy = parsePolicy(fetchOptions.trFetchOcspPolicy, DEFAULT_OCSP_POLICY, 'trFetchOcspPolicy');
