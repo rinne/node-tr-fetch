@@ -1,6 +1,6 @@
 {
     "name": "tr-fetch",
-    "version": "0.9.10",
+    "version": "1.0.0",
     "description": "Node.js fetch with CRL and OCSP certificate revocation checking, plus tr-curl, a curl-like test tool",
     "main": "index.js",
     "exports": {
@@ -25,7 +25,8 @@
         "serials.js",
         "transport.js",
         "bin/",
-        "tr-curl/"
+        "tr-curl/",
+        "CHANGELOG.md"
     ],
     "scripts": {
         "test": "node --test test/*.test.js"
