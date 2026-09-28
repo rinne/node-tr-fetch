@@ -10,10 +10,18 @@ const response = await trFetch('https://example.com/');
 console.log(await response.text());
 ```
 
-ES module default imports work too:
+`trFetch` and the error classes are also available by name:
+
+```js
+const { trFetch, TrFetchRevocationError, TrFetchCrlError, TrFetchOcspError } = require('tr-fetch');
+```
+
+ES module imports work either way too:
 
 ```js
 import trFetch from 'tr-fetch';
+// or
+import { trFetch, TrFetchRevocationError } from 'tr-fetch';
 ```
 
 The function calls Node's system `fetch()` and returns its native `Response`.

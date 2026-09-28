@@ -532,3 +532,48 @@ test('null and undefined mean the default for every trFetch option and policy se
     assert.equal(splitOptions({ trFetchCrlOverride: null, trFetchCrlDistributionPointOverride: 'http://ca.example/x.crl' }).distributionPoint,
                  'http://ca.example/x.crl');
 });
+
+test('trFetch is exported as the module itself and by name, with the error classes', function() {
+    const whole = require('..');
+    const { trFetch, TrFetchRevocationError, TrFetchCrlError, TrFetchOcspError } = require('..');
+    assert.equal(typeof whole, 'function');
+    assert.equal(trFetch, whole);
+    assert.equal(whole.trFetch.trFetch, whole);
+    assert.equal(require('../errors').TrFetchRevocationError, TrFetchRevocationError);
+    assert.equal(require('../errors').TrFetchCrlError, TrFetchCrlError);
+    assert.equal(require('../errors').TrFetchOcspError, TrFetchOcspError);
+    assert.deepEqual(Object.keys(whole).sort(), [ 'TrFetchCrlError', 'TrFetchOcspError', 'TrFetchRevocationError', 'trFetch' ]);
+});
+
+test('ES modules can import trFetch as the default or by name, and the error classes by name', function() {
+    const path = require('node:path');
+    const { execFileSync } = require('node:child_process');
+    // Imported by package name, as users do; the package refers to itself.
+    const script = `
+        import trFetchDefault, { trFetch, TrFetchRevocationError, TrFetchCrlError, TrFetchOcspError } from 'tr-fetch';
+        import * as namespace from 'tr-fetch';
+        let deep;
+        try {
+            await import('tr-fetch/check');
+            deep = 'importable';
+        } catch (error) {
+            deep = error.code;
+        }
+        console.log(JSON.stringify({
+            same: trFetchDefault === trFetch,
+            callable: typeof trFetch,
+            hierarchy: (new TrFetchCrlError('invalidCrl', 'x') instanceof TrFetchRevocationError) &&
+                (new TrFetchOcspError('rejectedCertificate', 'x') instanceof TrFetchRevocationError),
+            names: Object.keys(namespace).filter(key => ! [ 'default', 'module.exports' ].includes(key)).sort(),
+            deep
+        }));`;
+    const result = JSON.parse(execFileSync(process.execPath, [ '--input-type=module', '-e', script ],
+                                           { cwd: path.join(__dirname, '..'), encoding: 'utf8' }));
+    assert.deepEqual(result, {
+        same: true,
+        callable: 'function',
+        hierarchy: true,
+        names: [ 'TrFetchCrlError', 'TrFetchOcspError', 'TrFetchRevocationError', 'trFetch' ],
+        deep: 'ERR_PACKAGE_PATH_NOT_EXPORTED'
+    });
+});

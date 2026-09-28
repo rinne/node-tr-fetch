@@ -62,6 +62,7 @@ async function trFetch(input, options) {
 }
 
 module.exports = trFetch;
+module.exports.trFetch = trFetch;
 module.exports.TrFetchRevocationError = TrFetchRevocationError;
 module.exports.TrFetchCrlError = TrFetchCrlError;
 module.exports.TrFetchOcspError = TrFetchOcspError;
