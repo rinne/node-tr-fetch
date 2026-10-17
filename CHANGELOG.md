@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.1 (2026-10-17)
+
+- Fixed every fetch failing with "trFetch requires the default Undici
+  dispatcher" when Undici 8.12 or later is installed. Undici 8.12 stores its
+  new `tls` option as `undefined` in every Agent, and trFetch did not
+  recognize the default dispatcher with it. Options stored as `undefined`
+  now count as not configured; a dispatcher with any configured option is
+  still rejected.
+
 ## 1.0.0 (2026-09-28)
 
 First stable release. The API is feature complete, and from this release on
