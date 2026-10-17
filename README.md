@@ -460,6 +460,8 @@ configurations are rejected: silently replacing custom trust, pinning or proxy
 settings could weaken the application's security. Proxy agents and custom
 per-agent TLS configuration are therefore unsupported. Default-dispatcher
 recognition inspects Undici configuration and fails closed on unknown layouts.
+Options that Undici stores as `undefined` count as not configured; any
+configured option makes the dispatcher custom.
 
 System fetch drives the package's Undici agent through the dispatcher API of
 the Undici version bundled with Node.js. Their major versions must match;

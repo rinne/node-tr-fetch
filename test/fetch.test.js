@@ -631,6 +631,50 @@ test('full-chain excludes the trust anchor even with missing-DP reject', async f
     await (await trFetch(server.url, { trFetchCrlPolicy: { crlCheckDepth: 'full-chain', missingCrlDistributionPoint: 'reject' } })).text();
 });
 
+test('the default global dispatcher is recognized with options left undefined; configured ones still reject', async function(t) {
+    const { Agent, getGlobalDispatcher, setGlobalDispatcher } = require('undici');
+    const server = await endpoint(t, { urls: [ crlBase + '/good' ] });
+    const previous = getGlobalDispatcher();
+    const storedOptions = agent => agent[Object.getOwnPropertySymbols(agent).find(x => x.description === 'options')];
+    async function withGlobalDispatcher(agent, action) {
+        setGlobalDispatcher(agent);
+        try {
+            await action();
+        } finally {
+            setGlobalDispatcher(previous);
+            await agent.close();
+        }
+    }
+    const rejected = /custom or unrecognized global dispatchers/;
+    // Undici 8.12 stores tls: undefined in every Agent, including the default
+    // one; later releases may add other options the same way. Stored here
+    // directly, so the test holds whichever Undici is installed.
+    for (const unset of [ { tls: undefined }, { someFutureOption: undefined }, { tls: undefined, someFutureOption: undefined } ]) {
+        const agent = new Agent();
+        Object.assign(storedOptions(agent), unset);
+        await withGlobalDispatcher(agent, async function() {
+            assert.equal(await (await trFetch(server.url)).text(), 'ok', Object.keys(unset).join());
+        });
+    }
+    // Configured options make a dispatcher custom, so trFetch refuses rather
+    // than silently dropping its TLS, connection or proxy settings.
+    for (const options of [ { tls: { rejectUnauthorized: false } }, { tls: { ca: [ ca.pem ] } }, { connect: { rejectUnauthorized: false } },
+                            { connect: (options, callback) => callback(new Error('custom')) }, { maxOrigins: 10 }, { pipelining: 0 } ]) {
+        await withGlobalDispatcher(new Agent(options), async function() {
+            await assert.rejects(trFetch(server.url), rejected, Object.keys(options).join());
+        });
+    }
+    for (const configured of [ { tls: { rejectUnauthorized: false } }, { someFutureOption: 1 }, { someFutureOption: null },
+                               { someFutureOption: false }, { maxOrigins: 10 } ]) {
+        const agent = new Agent();
+        Object.assign(storedOptions(agent), configured);
+        await withGlobalDispatcher(agent, async function() {
+            await assert.rejects(trFetch(server.url), rejected, JSON.stringify(configured));
+        });
+    }
+    assert.equal(server.hits(), 3);
+});
+
 test('custom global dispatcher is rejected rather than silently losing its checks', async function() {
     const { Agent, getGlobalDispatcher, setGlobalDispatcher } = require('undici');
     const previous = getGlobalDispatcher();

@@ -24,10 +24,14 @@ function isDefaultAgent(agent) {
     const symbols = Object.getOwnPropertySymbols(agent);
     const options = agent[symbols.find(x => x.description === 'options')];
     const factory = agent[symbols.find(x => x.description === 'factory')];
+    // An option stored as undefined was not configured: Undici treats it as
+    // not given, and newer releases store new options that way (8.12 added
+    // tls). Any configured option, and maxOrigins other than its default,
+    // makes the dispatcher custom.
     return options && (typeof(factory) === 'function') &&
         (Function.prototype.toString.call(factory).replace(/[\s;]/g, '') === defaultFactory) &&
         Object.entries(options).every(([key, value]) =>
-            ((key === 'connect') && (value === undefined)) || ((key === 'maxOrigins') && (value === Infinity)));
+            (value === undefined) || ((key === 'maxOrigins') && (value === Infinity)));
 }
 
 // System fetch drives this package's Agent through the dispatcher handler
