@@ -3,7 +3,7 @@
 const { splitOptions } = require('./options');
 const { assertDefaultDispatcher, assertVerifiedResponse, createAgent } = require('./transport');
 const { checkChain } = require('./check');
-const { TrFetchRevocationError, TrFetchCrlError, TrFetchOcspError } = require('./errors');
+const { TrFetchRevocationError, TrFetchCrlError, TrFetchOcspError, emitWarning } = require('./errors');
 const { createDebug, debugUrl } = require('./debug');
 
 async function trFetch(input, options) {
@@ -27,9 +27,20 @@ async function trFetch(input, options) {
         ocspDepth: (config.ocspPolicy.ocspCheckDepth === Infinity) ? 'full-chain' : config.ocspPolicy.ocspCheckDepth,
         ocspCacheSize: config.ocspPolicy.ocspCacheSize,
         ocspCacheTTL: config.ocspPolicy.ocspCacheTTL,
+        ocspThisUpdateMaxClockSkew: config.ocspPolicy.ocspThisUpdateMaxClockSkew,
+        ocspNextUpdateMaxClockSkew: config.ocspPolicy.ocspNextUpdateMaxClockSkew,
         strategy: config.revocationPolicy.strategy,
         noRevocationStatus: config.revocationPolicy.noRevocationStatus
     });
+    // Accepting expired OCSP responses is never standard, so it always warns.
+    const nextUpdateSkew = config.ocspPolicy.ocspNextUpdateMaxClockSkew;
+    if (nextUpdateSkew > 0) {
+        debug?.('Non-standard OCSP validation configured', { ocspNextUpdateMaxClockSkew: nextUpdateSkew });
+        emitWarning(new TrFetchOcspError('ocspNextUpdateMaxClockSkew',
+            `Non-standard OCSP validation: responses are accepted up to ${nextUpdateSkew} seconds after their nextUpdate ` +
+            '(ocspNextUpdateMaxClockSkew), which can let a replayed stale response hide a revocation',
+            { ocspNextUpdateMaxClockSkew: nextUpdateSkew }), config.warningCb);
+    }
     const check = (config.policy.disabled && config.ocspPolicy.disabled) ? undefined :
           (peer, hostname) => checkChain(peer, hostname, config, signal);
     const agent = createAgent(check, signal);

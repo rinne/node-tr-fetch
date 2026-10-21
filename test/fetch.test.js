@@ -849,6 +849,130 @@ test('OCSP results are cached until the earlier of nextUpdate and the TTL, withi
     assert.equal(count('/oc-size'), 5);
 });
 
+test('future-dated OCSP responses are accepted within ocspThisUpdateMaxClockSkew, 15 minutes by default', async function(t) {
+    const count = path => crlRequests.filter(x => x.url === path).length;
+    const ocsp = options => ({ trFetchCrlPolicy: { disabled: true }, trFetchOcspPolicy: { ocspCacheTTL: 0, ...options } });
+    const ahead = seconds => ({ start: Date.now() + (seconds * 1000), producedAt: Date.now() + (seconds * 1000) });
+    // A CDN clock ten minutes ahead: accepted by default.
+    routes.set('/skew-600', ocspRoute(ca, ahead(600)));
+    const server = await endpoint(t, { ocspUrls: [ crlBase + '/skew-600' ], serial: 150 });
+    const warnings = [];
+    t.mock.method(process, 'emitWarning', warning => warnings.push(warning));
+    const events = captureDebug(t);
+    assert.equal(await (await trFetch(server.url, { ...ocsp(), trFetchDebug: true })).text(), 'ok');
+    assert.ok(events.some(x => (x.event === 'OCSP future-dated response allowed') && (x.ocspThisUpdateMaxClockSkew === 900) &&
+                          (x.aheadSeconds > 590) && (x.aheadSeconds <= 600)));
+    assert.ok(events.some(x => (x.event === 'Verification configured') && (x.ocspThisUpdateMaxClockSkew === 900) &&
+                          (x.ocspNextUpdateMaxClockSkew === 0)));
+    t.mock.restoreAll();
+    assert.equal(await (await trFetch(server.url, ocsp({ ocspThisUpdateMaxClockSkew: null }))).text(), 'ok');
+    assert.equal(await (await trFetch(server.url, ocsp({ ocspThisUpdateMaxClockSkew: 3600 }))).text(), 'ok');
+    // A smaller allowance rejects it with the rejectedCertificate policy.
+    for (const ocspThisUpdateMaxClockSkew of [ 0, 300 ]) {
+        await assert.rejects(trFetch(server.url, ocsp({ ocspThisUpdateMaxClockSkew })), function(error) {
+            assert.ok(error instanceof trFetch.TrFetchOcspError);
+            assert.equal(error.code, 'TR_FETCH_OCSP_CERTIFICATE_REJECTED');
+            assert.equal(error.ocspStatus, 'invalid-response');
+            assert.match(error.message, /Invalid OCSP response: OCSP producedAt is invalid or in the future/);
+            return true;
+        });
+    }
+    assert.equal(await (await trFetch(server.url, ocsp({ ocspThisUpdateMaxClockSkew: 0, rejectedCertificate: 'ignore' }))).text(), 'ok');
+    assert.equal(warnings.length, 0);
+    // More than 15 minutes ahead is rejected by default.
+    routes.set('/skew-960', ocspRoute(ca, ahead(960)));
+    const far = await endpoint(t, { ocspUrls: [ crlBase + '/skew-960' ], serial: 151 });
+    await assert.rejects(trFetch(far.url, ocsp()), { code: 'TR_FETCH_OCSP_CERTIFICATE_REJECTED' });
+    assert.equal(await (await trFetch(far.url, ocsp({ ocspThisUpdateMaxClockSkew: 1200 }))).text(), 'ok');
+    // Without an OCSP answer, ocsp-first falls back to the CRL.
+    const fallback = await endpoint(t, { urls: [ crlBase + '/good' ], ocspUrls: [ crlBase + '/skew-960' ], serial: 152 });
+    assert.equal(await (await trFetch(fallback.url, { trFetchOcspPolicy: { ocspCacheTTL: 0 } })).text(), 'ok');
+    // Cached future-dated results are used only within the caller's own allowance.
+    routes.set('/skew-cache', ocspRoute(ca, ahead(600)));
+    const cached = await endpoint(t, { ocspUrls: [ crlBase + '/skew-cache' ], serial: 153 });
+    const noCrl = { trFetchCrlPolicy: { disabled: true } };
+    await (await trFetch(cached.url, noCrl)).text();
+    await (await trFetch(cached.url, noCrl)).text();
+    assert.equal(count('/skew-cache'), 1);
+    const skipped = captureDebug(t);
+    await assert.rejects(trFetch(cached.url, { ...noCrl, trFetchDebug: true, trFetchOcspPolicy: { ocspThisUpdateMaxClockSkew: 60 } }),
+                         { code: 'TR_FETCH_OCSP_CERTIFICATE_REJECTED' });
+    t.mock.restoreAll();
+    assert.equal(count('/skew-cache'), 2);
+    assert.ok(skipped.some(x => (x.event === 'OCSP cached result skipped') && (x.ocspThisUpdateMaxClockSkew === 60)));
+    // The entry stays for callers that allow it.
+    await (await trFetch(cached.url, noCrl)).text();
+    assert.equal(count('/skew-cache'), 2);
+});
+
+test('ocspNextUpdateMaxClockSkew accepts recently expired OCSP responses, never caches them, and always warns', async function(t) {
+    const count = path => crlRequests.filter(x => x.url === path).length;
+    const ocsp = options => ({ trFetchCrlPolicy: { disabled: true }, trFetchOcspPolicy: options });
+    const expired = seconds => ({ start: Date.now() - 3600000, producedAt: Date.now() - 3600000, end: Date.now() - (seconds * 1000) });
+    routes.set('/next-60', ocspRoute(ca, expired(60)));
+    const server = await endpoint(t, { ocspUrls: [ crlBase + '/next-60' ], serial: 154 });
+    const emitted = [];
+    t.mock.method(process, 'emitWarning', warning => emitted.push(warning));
+    // nextUpdate is strict by default, whatever the thisUpdate allowance.
+    for (const options of [ {}, { ocspNextUpdateMaxClockSkew: null }, { ocspNextUpdateMaxClockSkew: 0 }, { ocspThisUpdateMaxClockSkew: 86400 } ]) {
+        await assert.rejects(trFetch(server.url, ocsp(options)), function(error) {
+            assert.equal(error.code, 'TR_FETCH_OCSP_CERTIFICATE_REJECTED');
+            assert.match(error.message, /OCSP response has expired or is stale/);
+            return true;
+        });
+    }
+    assert.equal(emitted.length, 0);
+    // Within the allowance it is accepted, with a process warning on every call.
+    const events = captureDebug(t);
+    assert.equal(await (await trFetch(server.url, { ...ocsp({ ocspNextUpdateMaxClockSkew: 120 }), trFetchDebug: true })).text(), 'ok');
+    assert.ok(events.some(x => (x.event === 'Non-standard OCSP validation configured') && (x.ocspNextUpdateMaxClockSkew === 120)));
+    assert.ok(events.some(x => (x.event === 'OCSP expired nextUpdate allowed') && (x.behindSeconds >= 60)));
+    assert.ok(events.some(x => (x.event === 'OCSP cache store skipped') && (x.reason === 'already expired')));
+    t.mock.restoreAll();
+    t.mock.method(process, 'emitWarning', warning => emitted.push(warning));
+    assert.equal(await (await trFetch(server.url, ocsp({ ocspNextUpdateMaxClockSkew: 120 }))).text(), 'ok');
+    // Never cached: the allowance does not extend the response's validity.
+    assert.equal(count('/next-60'), 6);
+    assert.equal(emitted.length, 2);
+    for (const warning of emitted) {
+        assert.ok(warning instanceof trFetch.TrFetchOcspError);
+        assert.equal(warning.name, 'TrFetchOcspWarning');
+        assert.equal(warning.code, 'TR_FETCH_OCSP_NONSTANDARD_VALIDATION');
+        assert.equal(warning.policyKey, 'ocspNextUpdateMaxClockSkew');
+        assert.equal(warning.ocspNextUpdateMaxClockSkew, 120);
+        assert.match(warning.message, /^trFetch: Non-standard OCSP validation: responses are accepted up to 120 seconds after their nextUpdate/);
+    }
+    // Beyond the allowance, rejected; still a warning, since it is configured.
+    await assert.rejects(trFetch(server.url, ocsp({ ocspNextUpdateMaxClockSkew: 30 })), { code: 'TR_FETCH_OCSP_CERTIFICATE_REJECTED' });
+    assert.equal(emitted.length, 3);
+    assert.equal(emitted[2].ocspNextUpdateMaxClockSkew, 30);
+    // The warning goes to trFetchWarningCb when given, also when OCSP is not checked.
+    const delivered = [];
+    const trFetchWarningCb = warning => delivered.push(warning);
+    assert.equal(await (await trFetch(server.url, { ...ocsp({ ocspNextUpdateMaxClockSkew: 120 }), trFetchWarningCb })).text(), 'ok');
+    const plain = await endpoint(t, { urls: [ crlBase + '/good' ], serial: 155 });
+    assert.equal(await (await trFetch(plain.url, { trFetchOcspPolicy: { disabled: true, ocspNextUpdateMaxClockSkew: 1 }, trFetchWarningCb })).text(),
+                 'ok');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(emitted.length, 3);
+    assert.deepEqual(delivered.map(x => [ x.name, x.code, x.ocspNextUpdateMaxClockSkew ]), [
+        [ 'TrFetchOcspWarning', 'TR_FETCH_OCSP_NONSTANDARD_VALIDATION', 120 ],
+        [ 'TrFetchOcspWarning', 'TR_FETCH_OCSP_NONSTANDARD_VALIDATION', 1 ]
+    ]);
+    // A valid response cached under the allowance is never used past its own nextUpdate.
+    routes.set('/next-short', ocspRoute(ca, { end: Date.now() + 1500 }));
+    const short = await endpoint(t, { ocspUrls: [ crlBase + '/next-short' ], serial: 156 });
+    const lenient = ocsp({ ocspNextUpdateMaxClockSkew: 3600, ocspCacheTTL: -1 });
+    await (await trFetch(short.url, { ...lenient, trFetchWarningCb })).text();
+    await (await trFetch(short.url, { ...lenient, trFetchWarningCb })).text();
+    assert.equal(count('/next-short'), 1);
+    await new Promise(resolve => setTimeout(resolve, 1600));
+    await assert.rejects(trFetch(short.url, ocsp({ ocspCacheTTL: -1 })), /expired or is stale/);
+    assert.equal(count('/next-short'), 2);
+    await (await trFetch(short.url, { ...lenient, trFetchWarningCb })).text();
+    assert.equal(count('/next-short'), 3);
+});
+
 test('strategy ocsp-first: OCSP answers alone; without an answer the CRL decides and OCSP failures are dropped', async function(t) {
     const count = path => crlRequests.filter(x => x.url === path).length;
     const first = extra => ({ trFetchCertificateRevocationPolicy: { strategy: 'ocsp-first', ...extra } });

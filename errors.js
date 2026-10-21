@@ -8,6 +8,7 @@ const CODES = {
     missingOcspUri: 'TR_FETCH_OCSP_MISSING_URI',
     unreachableOcspUri: 'TR_FETCH_OCSP_UNREACHABLE_URI',
     rejectedCertificate: 'TR_FETCH_OCSP_CERTIFICATE_REJECTED',
+    ocspNextUpdateMaxClockSkew: 'TR_FETCH_OCSP_NONSTANDARD_VALIDATION',
     noRevocationStatus: 'TR_FETCH_REVOCATION_STATUS_UNAVAILABLE'
 };
 
@@ -43,8 +44,20 @@ function callbackFireAndForget(...args) {
     })();
 }
 
-// Apply the configured action for a CRL or OCSP condition. Warnings go to
-// warningCb when given, and to process.emitWarning otherwise.
+// Deliver error as a warning: warningCb when given, process.emitWarning
+// otherwise. The warning's name ends in Warning instead of Error.
+function emitWarning(error, warningCb) {
+    const warning = new error.constructor(error.policyKey, error.message.slice(9), {}, error.cause);
+    Object.assign(warning, error);
+    warning.name = error.name.replace(/Error$/, 'Warning');
+    if (warningCb) {
+        callbackFireAndForget(warningCb, warning);
+    } else {
+        process.emitWarning(warning);
+    }
+}
+
+// Apply the configured action for a CRL or OCSP condition.
 function applyPolicy(policy, error, debug, warningCb) {
     const action = policy[error.policyKey];
     const kind = (error instanceof TrFetchOcspError) ? 'OCSP' : (error instanceof TrFetchCrlError) ? 'CRL' : 'Revocation';
@@ -55,15 +68,8 @@ function applyPolicy(policy, error, debug, warningCb) {
         throw error;
     }
     if (action === 'warn') {
-        const warning = new error.constructor(error.policyKey, error.message.slice(9), {}, error.cause);
-        Object.assign(warning, error);
-        warning.name = error.name.replace(/Error$/, 'Warning');
-        if (warningCb) {
-            callbackFireAndForget(warningCb, warning);
-        } else {
-            process.emitWarning(warning);
-        }
+        emitWarning(error, warningCb);
     }
 }
 
-module.exports = { TrFetchRevocationError, TrFetchCrlError, TrFetchOcspError, applyPolicy, callbackFireAndForget };
+module.exports = { TrFetchRevocationError, TrFetchCrlError, TrFetchOcspError, applyPolicy, emitWarning, callbackFireAndForget };

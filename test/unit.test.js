@@ -208,6 +208,7 @@ test('CRL URLs accept only HTTP(S), never files, LDAP or URL credentials', funct
 test('OCSP defaults, depth, override and disabled policy options are validated and stripped', function() {
     assert.deepEqual(splitOptions().ocspPolicy, {
         disabled: false, ocspCacheSize: 1024, ocspCacheTTL: 86400, ocspCheckDepth: 0,
+        ocspThisUpdateMaxClockSkew: 900, ocspNextUpdateMaxClockSkew: 0,
         missingOcspUri: 'ignore', unreachableOcspUri: 'reject', rejectedCertificate: 'reject'
     });
     for (const [depth, expected] of [ [ undefined, 0 ], [ 0, 0 ], [ 'leaf', 0 ], [ 2, 2 ], [ 'full-chain', Infinity ] ]) {
@@ -446,6 +447,34 @@ test('OCSP cache size and TTL are OCSP policy settings with CRL-like validation'
     for (const key of [ 'ocspCacheSize', 'ocspCacheTTL' ]) {
         assert.throws(() => splitOptions({ trFetchCrlPolicy: { [key]: 1 } }), /Unknown trFetchCrlPolicy property/);
     }
+});
+
+test('OCSP clock skews default to 900 and 0 seconds and take nonnegative safe integers up to 86400', function() {
+    const defaults = splitOptions().ocspPolicy;
+    assert.equal(defaults.ocspThisUpdateMaxClockSkew, 900);
+    assert.equal(defaults.ocspNextUpdateMaxClockSkew, 0);
+    for (const key of [ 'ocspThisUpdateMaxClockSkew', 'ocspNextUpdateMaxClockSkew' ]) {
+        const expected = { ocspThisUpdateMaxClockSkew: 900, ocspNextUpdateMaxClockSkew: 0 }[key];
+        for (const value of [ null, undefined ]) {
+            assert.equal(splitOptions({ trFetchOcspPolicy: { [key]: value } }).ocspPolicy[key], expected);
+        }
+        for (const value of [ 0, 1, 900, 3600, 86400 ]) {
+            assert.equal(splitOptions({ trFetchOcspPolicy: { [key]: value } }).ocspPolicy[key], value);
+        }
+        for (const value of [ -1, 86401, 1.5, '900', true, false, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1, 10n, {}, [] ]) {
+            assert.throws(() => splitOptions({ trFetchOcspPolicy: { [key]: value } }),
+                          new RegExp(`trFetchOcspPolicy\\.${key} must be a nonnegative safe integer of at most 86400 \\(seconds\\)`),
+                          String(value));
+        }
+        // OCSP settings only.
+        assert.throws(() => splitOptions({ trFetchCrlPolicy: { [key]: 1 } }), /Unknown trFetchCrlPolicy property/);
+        assert.throws(() => splitOptions({ trFetchCertificateRevocationPolicy: { [key]: 1 } }),
+                      /Unknown trFetchCertificateRevocationPolicy property/);
+    }
+    // Inherited settings are read like the others.
+    const inherited = Object.create({ ocspThisUpdateMaxClockSkew: 60, ocspNextUpdateMaxClockSkew: 30 });
+    const policy = splitOptions({ trFetchOcspPolicy: inherited }).ocspPolicy;
+    assert.deepEqual([ policy.ocspThisUpdateMaxClockSkew, policy.ocspNextUpdateMaxClockSkew ], [ 60, 30 ]);
 });
 
 test('the expiring cache reports its own label, and CRL cache events are unchanged', function() {

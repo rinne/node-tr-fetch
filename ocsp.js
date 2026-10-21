@@ -16,7 +16,9 @@ function ocspEntry(key) {
 
 // Authenticated 'good' and 'revoked' results by issuer, certificate and
 // responder URL, until the earlier of the response's nextUpdate (bounded by
-// its signer certificate) and the TTL. Never errors or 'unknown'.
+// its signer certificate) and the TTL. Never errors or 'unknown'. The
+// nextUpdate allowance never extends an entry, and a caller with a smaller
+// thisUpdate allowance skips entries still too far in the future for it.
 const cache = new ExpiringCache('OCSP cache', ocspEntry);
 
 const OCSP_ACCESS = '1.3.6.1.5.5.7.48.1';
@@ -102,7 +104,12 @@ async function authorizeSigner(signer, issuer, producedAt, now) {
     return after;
 }
 
-async function validateOcspResponse(bytes, request, certificate, issuer, now = Date.now(), debug) {
+// clockSkew allows thisUpdate (and producedAt, which cannot precede it) up
+// to clockSkew.thisUpdate seconds in the future, and accepts the response up
+// to clockSkew.nextUpdate seconds after its nextUpdate. Both default to 0.
+async function validateOcspResponse(bytes, request, certificate, issuer, now = Date.now(), debug, clockSkew = {}) {
+    const thisUpdateSkew = (clockSkew.thisUpdate ?? 0) * 1000;
+    const nextUpdateSkew = (clockSkew.nextUpdate ?? 0) * 1000;
     if (bytes.length > 1024 * 1024) {
         throw new Error('OCSP response exceeds the 1 MiB size limit');
     }
@@ -122,7 +129,7 @@ async function validateOcspResponse(bytes, request, certificate, issuer, now = D
         throw new Error('Unsupported OCSP response version');
     }
     const producedAt = data.producedAt.getTime();
-    if (! Number.isFinite(producedAt) || (producedAt > now)) {
+    if (! Number.isFinite(producedAt) || (producedAt > now + thisUpdateSkew)) {
         throw new Error('OCSP producedAt is invalid or in the future');
     }
     const extensions = checkExtensions(data.responseExtensions, [ NONCE ]);
@@ -145,11 +152,19 @@ async function validateOcspResponse(bytes, request, certificate, issuer, now = D
     // five minutes here, even if the transport just retrieved them successfully.
     const nextUpdate = single.nextUpdate?.getTime() ?? thisUpdate + 300000;
     if (! Number.isFinite(thisUpdate) || ! Number.isFinite(nextUpdate) ||
-        (thisUpdate > now) || (thisUpdate > producedAt) || (nextUpdate <= thisUpdate)) {
+        (thisUpdate > now + thisUpdateSkew) || (thisUpdate > producedAt) || (nextUpdate <= thisUpdate)) {
         throw new Error('OCSP response has invalid or future validity times');
     }
-    if (nextUpdate <= now) {
+    if (nextUpdate + nextUpdateSkew <= now) {
         throw new Error('OCSP response has expired or is stale');
+    }
+    if (producedAt > now) {
+        debug?.('OCSP future-dated response allowed', { thisUpdate, producedAt, aheadSeconds: (producedAt - now) / 1000,
+                                                     ocspThisUpdateMaxClockSkew: thisUpdateSkew / 1000 });
+    }
+    if (nextUpdate <= now) {
+        debug?.('OCSP expired nextUpdate allowed', { nextUpdate, behindSeconds: (now - nextUpdate) / 1000,
+                                                     ocspNextUpdateMaxClockSkew: nextUpdateSkew / 1000 });
     }
     if (! certificate.issuer.isEqual(issuer.subject) || ! await certificate.verify(issuer, cryptoEngine)) {
         throw new Error('OCSP issuer did not issue the checked certificate');
@@ -193,11 +208,13 @@ async function validateOcspResponse(bytes, request, certificate, issuer, now = D
             throw new Error('Malformed or future OCSP revocation time');
         }
     }
-    const expiresAt = Math.min(nextUpdate, signerExpiry);
-    if (Date.now() >= expiresAt) {
+    // nextUpdate is the response's own validity, used for caching; usableUntil
+    // adds the nextUpdate allowance for this check.
+    const usableUntil = Math.min(nextUpdate + nextUpdateSkew, signerExpiry);
+    if (Date.now() >= usableUntil) {
         throw new Error('OCSP response or signer certificate expired during validation');
     }
-    return { status: [ 'good', 'revoked', 'unknown' ][tag], nextUpdate: expiresAt };
+    return { status: [ 'good', 'revoked', 'unknown' ][tag], producedAt, nextUpdate: Math.min(nextUpdate, signerExpiry), usableUntil };
 }
 
 // Check a certificate with OCSP. Returns { answered, nextUpdate } for an
@@ -222,7 +239,7 @@ async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug
         responderDebug?.('OCSP check completed', { result: result.status, authenticated: true,
                                                    policy: 'rejectedCertificate', configuredAction: policy.rejectedCertificate,
                                                    action: (result.status === 'good') ? 'continue' : policy.rejectedCertificate,
-                                                   nextUpdate: result.nextUpdate, cached: result.cached });
+                                                   nextUpdate: result.usableUntil, cached: result.cached });
         if (result.status !== 'good') {
             const rejected = issue('rejectedCertificate', `OCSP rejected certificate: responder reports ${result.status}`, uri, undefined,
                                    result.status);
@@ -232,7 +249,7 @@ async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug
             }
             applyPolicy(policy, rejected, responderDebug, options.warningCb);
         }
-        return { answered: true, nextUpdate: result.nextUpdate };
+        return { answered: true, nextUpdate: result.usableUntil };
     }
     let certificate, uris, issuer, request;
     try {
@@ -255,10 +272,16 @@ async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug
     const identity = (peer.issuerCertificate?.raw === undefined) ? undefined :
         createHash('sha256').update(peer.issuerCertificate.raw).digest('hex') + ':' + createHash('sha256').update(peer.raw).digest('hex') + ':';
     const limits = [ policy.ocspCacheSize, policy.ocspCacheTTL ];
+    const clockSkew = { thisUpdate: policy.ocspThisUpdateMaxClockSkew, nextUpdate: policy.ocspNextUpdateMaxClockSkew };
     for (const uri of (identity === undefined) ? [] : uris.slice(0, 32)) {
-        const cached = cache.get(identity + uri, ...limits, Date.now(), debug);
-        if (cached) {
-            return completed({ ...cached, cached: true }, uri, responderDebugFor(uri));
+        const now = Date.now();
+        const cached = cache.get(identity + uri, ...limits, now, debug);
+        if (cached && (cached.producedAt > now + (clockSkew.thisUpdate * 1000))) {
+            responderDebugFor(uri)?.('OCSP cached result skipped', { reason: 'thisUpdate or producedAt too far in the future',
+                                                                    producedAt: cached.producedAt,
+                                                                    ocspThisUpdateMaxClockSkew: clockSkew.thisUpdate });
+        } else if (cached) {
+            return completed({ ...cached, usableUntil: cached.nextUpdate, cached: true }, uri, responderDebugFor(uri));
         }
     }
     try {
@@ -286,13 +309,14 @@ async function checkOcspCertificate(peer, hostname, options, signal, leaf, debug
         }
         let result;
         try {
-            result = await validateOcspResponse(bytes, request, certificate, issuer, Date.now(), responderDebug);
+            result = await validateOcspResponse(bytes, request, certificate, issuer, Date.now(), responderDebug, clockSkew);
         } catch (cause) {
             failures.push(issue('rejectedCertificate', `Invalid OCSP response: ${cause.message}`, uri, cause, 'invalid-response'));
             continue;
         }
         if (result.status !== 'unknown') {
-            cache.set(identity + uri, { status: result.status, nextUpdate: result.nextUpdate }, result.nextUpdate, fetchedAt,
+            cache.set(identity + uri, { status: result.status, producedAt: result.producedAt, nextUpdate: result.nextUpdate },
+                      result.nextUpdate, fetchedAt,
                       ...limits, Date.now(), debug);
         }
         return completed(result, uri, responderDebug);

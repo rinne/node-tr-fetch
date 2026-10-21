@@ -38,6 +38,10 @@ function ttlCb(value) {
     return (/^(-1|0|[1-9]\d*)$/.test(value) && Number.isSafeInteger(Number(value))) ? Number(value) : undefined;
 }
 
+function clockSkewCb(value) {
+    return (/^(0|[1-9]\d{0,4})$/.test(value) && (Number(value) <= 86400)) ? Number(value) : undefined;
+}
+
 function networkUrlCb(value) {
     return (URL.canParse(value) && [ 'http:', 'https:' ].includes(new URL(value).protocol)) ? value : undefined;
 }
@@ -124,6 +128,10 @@ function optionDefinitions() {
         arg(undefined, 'tr-fetch-crl-url', '<url> Fetch the server certificate\'s CRL from this URL instead', networkUrlCb),
         arg(undefined, 'tr-fetch-ocsp-cache-size', '<count> Cached OCSP results (default 1024; 0 disables)', integerCb),
         arg(undefined, 'tr-fetch-ocsp-cache-ttl', '<seconds> Longest OCSP result caching (default 86400; 0 disables, -1 no limit)', ttlCb),
+        arg(undefined, 'tr-fetch-ocsp-this-update-max-clock-skew',
+            '<seconds> Accept OCSP thisUpdate this far in the future (default 900; at most 86400)', clockSkewCb),
+        arg(undefined, 'tr-fetch-ocsp-next-update-max-clock-skew',
+            '<seconds> Accept OCSP responses this long after nextUpdate (default 0; non-standard, warns)', clockSkewCb),
         arg(undefined, 'tr-fetch-ocsp-url', '<url> Query this OCSP responder for the server certificate instead', networkUrlCb),
         arg(undefined, 'tr-fetch-options', '<json> Extra trFetch options as a JSON object', jsonObjectCb, true),
         arg('u', 'user', '<user:password> Server user and password (basic authentication)'),
@@ -183,7 +191,9 @@ function parseArguments(argv) {
     });
     mergePolicy('trFetchOcspPolicy', {
         ocspCacheSize: value('tr-fetch-ocsp-cache-size'),
-        ocspCacheTTL: value('tr-fetch-ocsp-cache-ttl')
+        ocspCacheTTL: value('tr-fetch-ocsp-cache-ttl'),
+        ocspThisUpdateMaxClockSkew: value('tr-fetch-ocsp-this-update-max-clock-skew'),
+        ocspNextUpdateMaxClockSkew: value('tr-fetch-ocsp-next-update-max-clock-skew')
     });
     if (value('tr-fetch-crl-url') !== undefined) {
         if (value('crlfile') !== undefined) {

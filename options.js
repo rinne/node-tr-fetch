@@ -1,6 +1,7 @@
 'use strict';
 
 const DEFAULT_MAX_CRL_BYTES = 16 * 1024 * 1024;
+const MAX_CLOCK_SKEW = 86400;
 
 const DEFAULT_POLICY = {
     disabled: false,
@@ -21,6 +22,8 @@ const DEFAULT_OCSP_POLICY = {
     ocspCacheSize: 1024,
     ocspCacheTTL: 86400,
     ocspCheckDepth: 0,
+    ocspThisUpdateMaxClockSkew: 900,
+    ocspNextUpdateMaxClockSkew: 0,
     missingOcspUri: 'ignore',
     unreachableOcspUri: 'reject',
     rejectedCertificate: 'reject'
@@ -94,6 +97,12 @@ function parsePolicy(value, defaults, name) {
             // Seconds; -1 means no limit beyond the data's own validity.
             if (! Number.isSafeInteger(setting) || (setting < -1)) {
                 throw new TypeError(`${name}.${key} must be -1 or a nonnegative safe integer (seconds)`);
+            }
+            policy[key] = setting;
+        } else if ((key === 'ocspThisUpdateMaxClockSkew') || (key === 'ocspNextUpdateMaxClockSkew')) {
+            // Seconds, at most a day.
+            if (! Number.isSafeInteger(setting) || (setting < 0) || (setting > MAX_CLOCK_SKEW)) {
+                throw new TypeError(`${name}.${key} must be a nonnegative safe integer of at most ${MAX_CLOCK_SKEW} (seconds)`);
             }
             policy[key] = setting;
         } else if (key === 'strategy') {

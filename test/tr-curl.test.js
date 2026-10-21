@@ -436,6 +436,42 @@ test('--tr-fetch-ocsp-cache-size and --tr-fetch-ocsp-cache-ttl set the OCSP cach
     }
 });
 
+test('--tr-fetch-ocsp-this-update-max-clock-skew and --tr-fetch-ocsp-next-update-max-clock-skew set the OCSP clock skews', async function() {
+    const help = (await curl([ '--help' ])).stdout;
+    assert.match(help, /--tr-fetch-ocsp-this-update-max-clock-skew <seconds>/);
+    assert.match(help, /--tr-fetch-ocsp-next-update-max-clock-skew <seconds>/);
+    const run = async args => {
+        const result = await curl([ '-s', '-v', '--cacert', caFile, '-o', path.join(tmp, 'skew'), ...args, secureUrl ]);
+        assert.equal(result.code, 0, args.join(' '));
+        return result;
+    };
+    const settings = async args => {
+        const result = await run(args);
+        return [ Number(result.stderr.match(/"ocspThisUpdateMaxClockSkew":(\d+)/)[1]),
+            Number(result.stderr.match(/"ocspNextUpdateMaxClockSkew":(\d+)/)[1]) ];
+    };
+    assert.deepEqual(await settings([]), [ 900, 0 ]);
+    assert.deepEqual(await settings([ '--tr-fetch-ocsp-this-update-max-clock-skew', '0' ]), [ 0, 0 ]);
+    assert.deepEqual(await settings([ '--tr-fetch-ocsp-this-update-max-clock-skew=86400', '--tr-fetch-ocsp-next-update-max-clock-skew', '0' ]),
+        [ 86400, 0 ]);
+    // Merged into the OCSP policy, over the same settings in --tr-fetch-options.
+    assert.deepEqual(await settings([ '--tr-fetch-options', '{"trFetchOcspPolicy":{"ocspThisUpdateMaxClockSkew":5,"ocspCacheTTL":5}}',
+        '--tr-fetch-ocsp-this-update-max-clock-skew', '7' ]), [ 7, 0 ]);
+    // Only the default strict nextUpdate goes without a warning.
+    const quiet = await run([]);
+    assert.doesNotMatch(quiet.stderr, /TR_FETCH_OCSP_NONSTANDARD_VALIDATION|Non-standard OCSP validation/);
+    const lenient = await curl([ '-s', '--cacert', caFile, '-o', path.join(tmp, 'skew'), '--tr-fetch-ocsp-next-update-max-clock-skew', '60',
+        secureUrl ]);
+    assert.equal(lenient.code, 0);
+    assert.match(lenient.stderr, /TrFetchOcspWarning.*Non-standard OCSP validation: responses are accepted up to 60 seconds after their nextUpdate/);
+    for (const args of [ [ '--tr-fetch-ocsp-this-update-max-clock-skew', '-1' ], [ '--tr-fetch-ocsp-this-update-max-clock-skew', '86401' ],
+        [ '--tr-fetch-ocsp-this-update-max-clock-skew', '1.5' ], [ '--tr-fetch-ocsp-this-update-max-clock-skew', '' ],
+        [ '--tr-fetch-ocsp-this-update-max-clock-skew', '0900' ], [ '--tr-fetch-ocsp-next-update-max-clock-skew', 'x' ],
+        [ '--tr-fetch-ocsp-next-update-max-clock-skew', '100000' ], [ '--tr-fetch-ocsp-next-update-max-clock-skew', '-0' ] ]) {
+        assert.equal((await curl([ '-s', ...args, secureUrl ])).code, 2, args.join(' '));
+    }
+});
+
 test('--tr-fetch-revocation-strategy and --tr-fetch-no-revocation-status set the certificate revocation policy', async function() {
     const help = (await curl([ '--help' ])).stdout;
     assert.match(help, /--tr-fetch-revocation-strategy <both\|ocsp-first\|crl-first>/);

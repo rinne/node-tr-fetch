@@ -52,6 +52,8 @@ const response = await trFetch(url, {
 		ocspCacheSize: 1024,
 		ocspCacheTTL: 86400,
 		ocspCheckDepth: 0,
+		ocspThisUpdateMaxClockSkew: 900,
+		ocspNextUpdateMaxClockSkew: 0,
 		missingOcspUri: 'ignore',
 		unreachableOcspUri: 'reject',
 		rejectedCertificate: 'reject'
@@ -387,6 +389,7 @@ two. All are surfaced directly instead of being hidden beneath fetch's generic
 | `TR_FETCH_OCSP_UNREACHABLE_URI` | `unreachableOcspUri` |
 | `TR_FETCH_OCSP_CERTIFICATE_REJECTED` | `rejectedCertificate` |
 | `TR_FETCH_REVOCATION_STATUS_UNAVAILABLE` | `noRevocationStatus` |
+| `TR_FETCH_OCSP_NONSTANDARD_VALIDATION` | `ocspNextUpdateMaxClockSkew` (a warning only; see [OCSP clock skew](#ocsp-clock-skew)) |
 
 Messages explain the specific failure. Certificate errors include `policyKey`,
 `hostname`, `serialNumber`, `fingerprint256`, and, when applicable,
@@ -537,10 +540,11 @@ without no-check are currently unsupported because their own revocation status
 would require a separate validation path. Weak delegate certificate signatures
 and RSA keys shorter than 2048 bits are rejected.
 
-Response `producedAt` and `thisUpdate` must not be in the future. `nextUpdate`,
-when present, must not have passed. When it is absent, the response is accepted
-for at most five minutes after `thisUpdate`. Signer certificate expiry also
-bounds validity. Unknown critical extensions and duplicate or mismatched
+Response `producedAt` and `thisUpdate` must not be more than
+`ocspThisUpdateMaxClockSkew` seconds (by default 15 minutes) in the future.
+`nextUpdate`, when present, must not have passed. When it is absent, the
+response is accepted for at most five minutes after `thisUpdate`. Signer
+certificate expiry also bounds validity (see [OCSP clock skew](#ocsp-clock-skew)). Unknown critical extensions and duplicate or mismatched
 certificate identifiers reject. If a responder returns a nonce, it must match
 the request; responders that omit it remain subject to the validity-time checks.
 
@@ -549,6 +553,29 @@ An authenticated revoked or unknown status immediately invokes
 `rejectedCertificate`; the client does not seek a different answer elsewhere.
 Malformed, unsuccessful or unauthenticated responses also use that policy when
 no usable alternative exists, with a distinct explanatory message.
+
+#### OCSP clock skew
+
+Some major CAs serve OCSP responses through CDNs whose clocks run ahead, and
+their responses can have a `thisUpdate` more than ten minutes in the future.
+Like common TLS clients, trFetch accepts such responses within a limit:
+
+- `trFetchOcspPolicy.ocspThisUpdateMaxClockSkew` defaults to `900` **seconds**
+  (15 minutes): how far in the future a response's `thisUpdate` may be. It
+  applies to `producedAt` too, which cannot precede `thisUpdate`. `0` requires
+  both to be in the past.
+- `trFetchOcspPolicy.ocspNextUpdateMaxClockSkew` defaults to `0` **seconds**:
+  `nextUpdate` is enforced strictly. A positive value accepts a response for
+  that long after its `nextUpdate`. This is non-standard and lets an attacker
+  replay a stale `good` response for a revoked certificate during that time,
+  so every trFetch call with a positive value emits a `TrFetchOcspWarning`
+  with the code `TR_FETCH_OCSP_NONSTANDARD_VALIDATION`, through
+  `trFetchWarningCb` when given.
+
+Both take a nonnegative integer of at most `86400` (a day); `null` means the
+default. The allowances never extend a cached result beyond the response's own
+`nextUpdate`, and a cached result is used only if its `producedAt` is within
+the caller's own `thisUpdate` allowance.
 
 OCSP responder HTTPS connections receive normal TLS verification. Their own
 revocation endpoints are not recursively queried. This is active OCSP lookup;
@@ -619,7 +646,7 @@ tr-curl --cacert private-ca.pem --crlfile current.crl https://internal.example/
 | Failure and limits | `-f/--fail`, `--fail-with-body`, `--fail-early`, `--max-filesize`, `-m/--max-time` |
 | Messages | `-v/--verbose`, `-s/--silent`, `-S/--show-error`, `--no-progress-meter`, `-#/--progress-bar`, `-h/--help`, `-V/--version` |
 | TLS | `-k/--insecure`, `--cacert`, `--crlfile`, `-1/--tlsv1`, `--tlsv1.0` … `--tlsv1.3`, `--tls-max`, `--ciphers`, `--tls13-ciphers` |
-| trFetch | `--tr-fetch-revocation-strategy`, `--tr-fetch-no-revocation-status`, `--tr-fetch-max-crl-bytes`, `--tr-fetch-crl-cache-scope`, `--tr-fetch-crl-certificate-cache-size`, `--tr-fetch-crl-url`, `--tr-fetch-ocsp-cache-size`, `--tr-fetch-ocsp-cache-ttl`, `--tr-fetch-ocsp-url`, `--tr-fetch-options` |
+| trFetch | `--tr-fetch-revocation-strategy`, `--tr-fetch-no-revocation-status`, `--tr-fetch-max-crl-bytes`, `--tr-fetch-crl-cache-scope`, `--tr-fetch-crl-certificate-cache-size`, `--tr-fetch-crl-url`, `--tr-fetch-ocsp-cache-size`, `--tr-fetch-ocsp-cache-ttl`, `--tr-fetch-ocsp-this-update-max-clock-skew`, `--tr-fetch-ocsp-next-update-max-clock-skew`, `--tr-fetch-ocsp-url`, `--tr-fetch-options` |
 
 `--verbose` prints the request and response headers, prefixed with `>` and
 `<` like curl, and also enables `trFetchDebug`, so the revocation diagnostics
@@ -636,6 +663,8 @@ The `--tr-fetch-*` options set trFetch options directly:
 | `--tr-fetch-crl-url <url>` | `trFetchCrlDistributionPointOverride` |
 | `--tr-fetch-ocsp-cache-size <count>` | `trFetchOcspPolicy.ocspCacheSize`, an integer |
 | `--tr-fetch-ocsp-cache-ttl <seconds>` | `trFetchOcspPolicy.ocspCacheTTL`, `-1` or more |
+| `--tr-fetch-ocsp-this-update-max-clock-skew <seconds>` | `trFetchOcspPolicy.ocspThisUpdateMaxClockSkew`, `0` to `86400` |
+| `--tr-fetch-ocsp-next-update-max-clock-skew <seconds>` | `trFetchOcspPolicy.ocspNextUpdateMaxClockSkew`, `0` to `86400` |
 | `--tr-fetch-revocation-strategy <both\|ocsp-first\|crl-first>` | `trFetchCertificateRevocationPolicy.strategy` |
 | `--tr-fetch-no-revocation-status <ignore\|warn\|reject>` | `trFetchCertificateRevocationPolicy.noRevocationStatus` |
 | `--tr-fetch-ocsp-url <url>` | `trFetchOcspUriOverride` |
