@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.1.0 (2026-10-21)
+
+- OCSP responses may now have a `thisUpdate` (and `producedAt`) up to
+  `trFetchOcspPolicy.ocspThisUpdateMaxClockSkew` seconds in the future,
+  `900` (15 minutes) by default. Some major CAs serve responses through CDNs
+  whose clocks run ahead, and 1.0.x rejected those responses. Set `0` for the
+  earlier strict check.
+- New `trFetchOcspPolicy.ocspNextUpdateMaxClockSkew` (default `0`, strict)
+  accepts responses for that many seconds after their `nextUpdate`. It is
+  non-standard, so a positive value emits a `TrFetchOcspWarning` with the
+  code `TR_FETCH_OCSP_NONSTANDARD_VALIDATION` on every call.
+- Both take `0` to `86400` seconds. They never extend a cached result
+  beyond the response's own `nextUpdate`.
+- New `tr-curl` options `--tr-fetch-ocsp-this-update-max-clock-skew` and
+  `--tr-fetch-ocsp-next-update-max-clock-skew`.
+
 ## 1.0.1 (2026-10-17)
 
 - Fixed every fetch failing with "trFetch requires the default Undici
